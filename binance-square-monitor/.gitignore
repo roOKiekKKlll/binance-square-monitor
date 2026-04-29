@@ -1,0 +1,58 @@
+# =============== Python ===============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+
+# =============== 虚拟环境 ===============
+.venv/
+venv/
+env/
+ENV/
+
+# =============== 项目运行时数据（不要传到 GitHub）===============
+# 数据库
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+binance_square.db*
+
+# 进程状态
+.monitor_processes.json
+
+# Playwright 持久化登录数据
+user_data/
+.user_data/
+
+# 日志
+*.log
+logs/
+
+# =============== 编辑器 / IDE ===============
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =============== 系统 ===============
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============== 测试 / 覆盖率 ===============
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# =============== 个人配置覆盖（如果用户想本地 override 某些参数）===============
+config_local.py
+.env
+.env.local

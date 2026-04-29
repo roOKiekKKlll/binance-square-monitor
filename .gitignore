@@ -1,0 +1,44 @@
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python 缓存（防御性）
+__pycache__/
+*.py[cod]
+
+# 虚拟环境（防御性）
+.venv/
+venv/
+
+# 项目运行时数据
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.monitor_processes.json
+user_data/
+.user_data/
+
+# 日志
+*.log
+logs/
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 源码归档（已经在 binance-square-monitor/ 子目录里了）
+binance-square-monitor.zip
+
+# 个人配置 / 环境变量
+.env
+.env.local
+config_local.py
