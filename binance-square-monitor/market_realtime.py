@@ -249,9 +249,13 @@ async def run_for_watchlist(tokens: list[str]):
     url = FSTREAM_BASE + "/".join(streams)
     state = RealtimeState(tokens)
     last_flush = 0.0
+    consecutive_errors = 0
+    last_error_msg = ""
+    last_error_log_at = 0.0
+
     console.print(f"[green]实时行情订阅: {', '.join(sorted(token_set))}[/green]")
     ssl_context = ssl._create_unverified_context()
-    async with websockets.connect(url, ping_interval=150, ping_timeout=600,ssl=ssl_context) as ws:
+    async with websockets.connect(url, ping_interval=150, ping_timeout=600, ssl=ssl_context) as ws:
         last_watchlist_check = 0.0
         while _running:
             now = time.time()
@@ -265,10 +269,27 @@ async def run_for_watchlist(tokens: list[str]):
                 raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 event = json.loads(raw)
                 state.handle(event)
+                consecutive_errors = 0
             except asyncio.TimeoutError:
                 pass
+            except websockets.exceptions.ConnectionClosed as e:
+                console.print(f"[yellow]WS 连接已关闭({e.code}), 将重建连接...[/yellow]")
+                return
             except Exception as e:
-                console.print(f"[dim red]实时消息处理失败: {e}[/dim red]")
+                consecutive_errors += 1
+                err_str = str(e)
+                now_t = time.time()
+                if err_str != last_error_msg or now_t - last_error_log_at >= 10:
+                    console.print(
+                        f"[dim red]实时消息处理失败: {e}"
+                        f"{f' (连续 {consecutive_errors} 次)' if consecutive_errors > 1 else ''}"
+                        f"[/dim red]"
+                    )
+                    last_error_msg = err_str
+                    last_error_log_at = now_t
+                if consecutive_errors >= 50:
+                    console.print("[yellow]连续错误过多，将重建连接...[/yellow]")
+                    return
 
             now = time.time()
             if now - last_flush >= config.REALTIME_CACHE_FLUSH_SECONDS:
