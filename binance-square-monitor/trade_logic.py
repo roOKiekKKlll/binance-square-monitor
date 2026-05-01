@@ -245,6 +245,56 @@ def build_trade_candidates(conn, limit: int = 20, passed_only: bool = False) -> 
     return candidates
 
 
+def position_remaining_ratio(pos: dict) -> float:
+    """返回仓位剩余比例（0~1）。
+
+    PARTIAL 状态下，已被 TP1/TP2 平掉的部分不再占用保证金，
+    剩余比例 = (quantity - closed_qty) / quantity。
+
+    PENDING / OPEN / 数量异常时返回 1.0（视为完整仓位）。
+    """
+    try:
+        qty = float(pos.get("quantity") or 0)
+        closed = float(pos.get("closed_qty") or 0)
+    except (TypeError, ValueError):
+        return 1.0
+    if qty <= 0:
+        return 1.0
+    remaining = (qty - closed) / qty
+    if remaining < 0:
+        return 0.0
+    if remaining > 1:
+        return 1.0
+    return remaining
+
+
+def position_live_margin(pos: dict) -> float:
+    """根据 status 和 closed_qty 返回当前真正占用的保证金。
+
+    - PENDING：原始保证金（订单未成交但已预留）
+    - OPEN / PARTIAL：margin_amount × 剩余比例
+    - 其他（CLOSED / CANCELED）：0
+    """
+    status = pos.get("status")
+    margin = float(pos.get("margin_amount") or 0)
+    if status == "PENDING":
+        return margin
+    if status in {"OPEN", "PARTIAL"}:
+        return margin * position_remaining_ratio(pos)
+    return 0.0
+
+
+def position_live_notional(pos: dict) -> float:
+    """同 position_live_margin，但返回名义价值（仓位价值）。"""
+    status = pos.get("status")
+    notional = float(pos.get("notional") or 0)
+    if status == "PENDING":
+        return notional
+    if status in {"OPEN", "PARTIAL"}:
+        return notional * position_remaining_ratio(pos)
+    return 0.0
+
+
 def account_summary(conn) -> dict:
     settings = storage.trading_settings_get(conn)
     positions = storage.trade_positions_all(conn, limit=500)
@@ -252,8 +302,8 @@ def account_summary(conn) -> dict:
     realized = sum(float(p.get("realized_pnl") or 0) for p in positions)
     unrealized = sum(float(p.get("unrealized_pnl") or 0)
                      for p in positions if p.get("status") in {"OPEN", "PARTIAL"})
-    locked = sum(float(p.get("margin_amount") or 0)
-                 for p in positions if p.get("status") in {"PENDING", "OPEN", "PARTIAL"})
+    # 实时占用保证金：PARTIAL 仓位按剩余 qty 比例计算（已被 TP1/TP2 平掉的部分释放）
+    locked = sum(position_live_margin(p) for p in positions)
     equity = initial + realized + unrealized
     available = initial + realized - locked
     return {
@@ -377,13 +427,7 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
     stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
     stop_loss_price = estimated_entry * (1 + stop_pct / 100)
 
-    # 抢 signal lock
-    signal_key = candidate.get("signal_key") or storage.leaderboard_signal_key(conn)
-    if not storage.trade_signal_lock_acquire(conn, token, signal_key):
-        _debug_reject(token, f"signal_lock 已占用 (signal_key={signal_key})", candidate)
-        return False
-
-    # 计算仓位
+    # 计算仓位（先算，sizing 失败不应该消耗 signal_lock）
     leverage = float(settings.get("leverage") or config.TRADING_LEVERAGE)
     sizing = risk.compute_position_size(account, estimated_entry, stop_loss_price, leverage, tier)
     if sizing.get("quantity", 0) <= 0:
@@ -395,16 +439,17 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
     notional = sizing["notional"]
     risk_amount = sizing["risk_amount"]
 
-    # 实盘硬限额检查
+    # 实盘硬限额检查（同样在抢锁前，避免被限额挡住却消耗 lock）
     if is_live:
         max_size = getattr(config, "LIVE_MAX_POSITION_SIZE_USD", 500)
         if notional > max_size:
             _debug_reject(token, f"名义价值 ${notional:.0f} 超过实盘单笔限额 ${max_size:.0f}", candidate)
             return False
-        # 总敞口限额
         max_total = getattr(config, "LIVE_MAX_TOTAL_EXPOSURE_USD", 2000)
+        # 注意：用 live_notional 而不是原始 notional，
+        # PARTIAL 仓位已被 TP1/TP2 平掉的部分不应再算作敞口
         existing_notional = sum(
-            float(p.get("notional") or 0) for p in storage.trade_open_positions(conn)
+            position_live_notional(p) for p in storage.trade_open_positions(conn)
             if p.get("mode") == "live"
         )
         if existing_notional + notional > max_total:
@@ -434,20 +479,34 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         },
     }
 
-    # === 下单 ===
+    # === 抢 signal lock（已经走到这一步，所有前置检查全部通过）===
+    # 只在真正要下单的最后一刻抢锁。这样 sizing/限额失败不会浪费 lock，
+    # 同时下单失败也会主动释放，不会让本轮 heat round 内的同一 token 再也开不了仓。
+    signal_key = candidate.get("signal_key") or storage.leaderboard_signal_key(conn)
+    if not storage.trade_signal_lock_acquire(conn, token, signal_key):
+        _debug_reject(token, f"signal_lock 已占用 (signal_key={signal_key})", candidate)
+        return False
+
+    # === 下单（从这里开始任何失败路径都必须释放 lock）===
     symbol = f"{token}USDT"
     tp1_qty = quantity * (config.TRADING_TP1_CLOSE_PCT / 100)
-    order_result = executor.open_long(
-        symbol=symbol,
-        quantity=quantity,
-        entry_price=raw_price,
-        stop_loss_price=stop_loss_price,
-        tp1_price=tp1_price,
-        tp1_qty=tp1_qty,
-        leverage=int(leverage),
-    )
+    try:
+        order_result = executor.open_long(
+            symbol=symbol,
+            quantity=quantity,
+            entry_price=raw_price,
+            stop_loss_price=stop_loss_price,
+            tp1_price=tp1_price,
+            tp1_qty=tp1_qty,
+            leverage=int(leverage),
+        )
+    except Exception as e:
+        storage.trade_signal_lock_release(conn, token, signal_key)
+        _debug_reject(token, f"下单异常: {e}", candidate)
+        raise
 
     if not order_result.success:
+        storage.trade_signal_lock_release(conn, token, signal_key)
         _debug_reject(token, f"下单失败: {order_result.error}", candidate)
         return False
 
@@ -464,6 +523,7 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         margin = notional / leverage
 
     mode_label = "实盘" if is_live else "模拟"
+    stop_pending = bool(order_result.extra.get("stop_order_pending")) if order_result.extra else False
     position = {
         "token": token,
         "symbol": symbol,
@@ -491,12 +551,41 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
             f"风险 ${risk_amount:.2f} ({(risk_amount/account.equity*100) if account.equity else 0:.2f}% equity)"
         ),
         "advice": (
+            "⚠️ 止损因网络问题待补挂，live_manager 将继续重试"
+            if stop_pending else
             f"{'满仓' if tier == 'full' else '半仓'}持有：等待 +{config.TRADING_TP1_R}R 止盈 / "
             f"{sizing.get('stop_distance_pct', 0):.2f}% 止损"
         ),
     }
     pos_id = storage.trade_position_insert(conn, position)
     if not pos_id:
+        # DB 写入失败：lock 释放避免阻塞重试。
+        # 实盘场景特别危险 —— 交易所已有真实仓位但本地无记录，无法管理止盈止损。
+        # 紧急平仓兜底，避免出现"漂在交易所的孤儿仓位"。
+        storage.trade_signal_lock_release(conn, token, signal_key)
+        if is_live:
+            import sys
+            print(
+                f"[trade-logic] ⚠️ 实盘已开仓但 DB 写入失败 {token}！尝试紧急平仓 qty={actual_qty}",
+                file=sys.stderr, flush=True,
+            )
+            try:
+                close_result = executor.close_position(symbol, actual_qty, "db_insert_failed")
+                if close_result.success:
+                    print(
+                        f"[trade-logic] 紧急平仓成功 {token}",
+                        file=sys.stderr, flush=True,
+                    )
+                else:
+                    print(
+                        f"[trade-logic] ⚠️⚠️ 紧急平仓也失败 {token}: {close_result.error}！请手动检查交易所",
+                        file=sys.stderr, flush=True,
+                    )
+            except Exception as e:
+                print(
+                    f"[trade-logic] ⚠️⚠️ 紧急平仓异常 {token}: {e}！请手动检查交易所",
+                    file=sys.stderr, flush=True,
+                )
         _debug_reject(token, "DB insert 失败（唯一索引冲突？）", candidate)
         return False
 
@@ -594,7 +683,7 @@ def manual_open_on_watch(conn, token: str, settings: dict, executor=None) -> dic
             return {"ok": False, "reason": f"名义价值 ${notional:.0f} 超过实盘单笔限额 ${max_size:.0f}"}
         max_total = getattr(config, "LIVE_MAX_TOTAL_EXPOSURE_USD", 2000)
         existing_notional = sum(
-            float(p.get("notional") or 0) for p in storage.trade_open_positions(conn)
+            position_live_notional(p) for p in storage.trade_open_positions(conn)
             if p.get("mode") == "live"
         )
         if existing_notional + notional > max_total:
@@ -672,6 +761,30 @@ def manual_open_on_watch(conn, token: str, settings: dict, executor=None) -> dic
     }
     pos_id = storage.trade_position_insert(conn, position)
     if not pos_id:
+        # DB 写入失败：实盘场景必须兜底，避免交易所出现孤儿仓位。
+        if is_live:
+            import sys
+            print(
+                f"[trade-logic] ⚠️ 实盘手动开仓已成交但 DB 写入失败 {token}，尝试紧急平仓 qty={actual_qty}",
+                file=sys.stderr, flush=True,
+            )
+            try:
+                close_result = executor.close_position(symbol, actual_qty, "db_insert_failed")
+                if close_result.success:
+                    print(
+                        f"[trade-logic] 手动开仓 DB 失败后紧急平仓成功 {token}",
+                        file=sys.stderr, flush=True,
+                    )
+                else:
+                    print(
+                        f"[trade-logic] ⚠️⚠️ 手动开仓 DB 失败后紧急平仓失败 {token}: {close_result.error}，请手动检查交易所",
+                        file=sys.stderr, flush=True,
+                    )
+            except Exception as e:
+                print(
+                    f"[trade-logic] ⚠️⚠️ 手动开仓 DB 失败后紧急平仓异常 {token}: {e}，请手动检查交易所",
+                    file=sys.stderr, flush=True,
+                )
         return {"ok": False, "reason": "DB 写入失败（可能并发冲突）"}
 
     # live 模式：记录交易所订单 ID

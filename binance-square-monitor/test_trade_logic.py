@@ -9,6 +9,7 @@ os.environ.setdefault("PYTHONPATH", "/home/claude/work")
 import sqlite3
 import json
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import config
 import storage
@@ -135,8 +136,73 @@ def test_tp1_already_done_not_retriggered():
     print(f"OK TP1 不重复触发: closed_qty={pos['closed_qty']} (TP1_PCT={config.TRADING_TP1_CLOSE_PCT}%)")
 
 
+def test_manual_live_open_db_failure_triggers_emergency_close():
+    """实盘手动开仓：若下单成功但 DB 写入失败，应立即紧急平仓避免孤儿仓位。"""
+    import trade_logic
+    from executor import BinanceLiveExecutor, OrderResult
+
+    conn = _setup_db()
+    settings = {"leverage": 2}
+
+    # 用假 key 初始化，确保 isinstance 判断与线上一致。
+    with patch.dict(os.environ, {"BINANCE_API_KEY": "test-key", "BINANCE_API_SECRET": "test-secret"}):
+        live_executor = BinanceLiveExecutor()
+    close_calls = []
+
+    def _open_long(**kwargs):
+        return OrderResult(
+            success=True,
+            order_id="12345",
+            fill_price=100.0,
+            fill_qty=1.25,
+            status="FILLED",
+            extra={"entry_order_id": "12345"},
+        )
+
+    def _close_position(symbol, quantity, reason=""):
+        close_calls.append((symbol, quantity, reason))
+        return OrderResult(success=True, order_id="54321", fill_price=99.8, fill_qty=quantity, status="FILLED")
+
+    live_executor.open_long = _open_long
+    live_executor.close_position = _close_position
+
+    with patch("trade_logic.storage.trade_has_active", return_value=False), \
+         patch("trade_logic._load_market", return_value={}), \
+         patch("trade_logic._load_realtime", return_value={}), \
+         patch("trade_logic._current_price", return_value=100.0), \
+         patch.object(config, "LIVE_MAX_POSITION_SIZE_USD", 1000.0), \
+         patch.object(config, "LIVE_MAX_TOTAL_EXPOSURE_USD", 5000.0), \
+         patch("trade_logic.get_klines_1h", return_value=[]), \
+         patch("trade_logic._build_account_context", return_value=SimpleNamespace(equity=1000.0, available_balance=1000.0)), \
+         patch("trade_logic.risk.check_account_risk", return_value=SimpleNamespace(allowed=True, reason="")), \
+         patch("trade_logic.risk.compute_stop_distance_pct", return_value=(-2.0, "fixed")), \
+         patch("trade_logic.risk.compute_position_size", return_value={
+             "quantity": 1.2,
+             "margin": 60.0,
+             "notional": 120.0,
+             "risk_amount": 4.0,
+             "stop_distance_pct": -2.0,
+         }), \
+         patch("trade_logic.storage.trade_open_positions", return_value=[]), \
+         patch("trade_logic.storage.trade_position_insert", return_value=None):
+        result = trade_logic.manual_open_on_watch(conn, "BTC", settings, live_executor)
+
+    assert result["ok"] is False
+    assert close_calls, f"DB 写入失败后应调用 close_position 进行紧急平仓，result={result}"
+    symbol, qty, reason = close_calls[0]
+    assert symbol == "BTCUSDT"
+    assert abs(qty - 1.25) < 1e-9
+    assert reason == "db_insert_failed"
+    print(f"OK DB 失败已触发紧急平仓: {symbol} qty={qty} reason={reason}")
+
+
 if __name__ == "__main__":
-    tests = [test_tp2_can_trigger, test_stop_loss_with_slippage, test_tp1_already_done_not_retriggered]
+    tests = [
+        test_tp2_can_trigger,
+        test_stop_loss_with_slippage,
+        test_tp1_already_done_not_retriggered,
+        test_manual_live_open_db_failure_triggers_emergency_close,
+    ]
     failed = 0
     for t in tests:
         try:

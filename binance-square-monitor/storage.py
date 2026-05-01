@@ -688,6 +688,16 @@ def trade_positions_all(conn, limit: int = 50) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def trade_positions_by_mode(conn, mode: str, limit: int = 50) -> list[dict]:
+    cur = conn.execute("""
+        SELECT * FROM trade_positions
+        WHERE mode = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (mode, limit))
+    return [dict(r) for r in cur.fetchall()]
+
+
 def trade_has_active(conn, token: str) -> bool:
     row = conn.execute("""
         SELECT 1 FROM trade_positions
@@ -706,6 +716,19 @@ def trade_signal_lock_acquire(conn, token: str, signal_key: str) -> bool:
         return True
     except sqlite3.IntegrityError:
         return False
+
+
+def trade_signal_lock_release(conn, token: str, signal_key: str) -> bool:
+    """释放某 token 在指定 signal_key 下的 lock。
+
+    下单失败 / sizing 失败 / DB 写入失败时调用，避免本轮 heat round
+    内即使条件恢复也无法重试。返回是否实际删除了一条记录。
+    """
+    cur = conn.execute(
+        "DELETE FROM trade_signal_locks WHERE token = ? AND signal_key = ?",
+        (token.upper(), signal_key),
+    )
+    return (cur.rowcount or 0) > 0
 
 
 def trade_signal_lock_cleanup(conn, retention_hours: int = 72) -> int:

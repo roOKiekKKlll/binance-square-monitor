@@ -22,6 +22,7 @@ from executor import BinanceLiveExecutor
 
 _last_reconcile_at = 0.0
 _last_trailing_update: dict[int, float] = {}  # pos_id → timestamp
+_last_stop_repair_at: dict[int, float] = {}   # pos_id → timestamp
 
 
 def _log(msg: str):
@@ -90,6 +91,10 @@ def _manage_one_position(pos: dict, executor: BinanceLiveExecutor):
     if entry <= 0 or open_qty <= 0:
         return
 
+    # 开仓后若止损因为网络抖动没挂上，持续补挂，避免靠紧急平仓消耗手续费。
+    if not stop_oid:
+        _repair_missing_stop(pos, executor, open_qty)
+
     tp1_pct = config.TRADING_TP1_CLOSE_PCT / 100
     tp2_pct = config.TRADING_TP2_CLOSE_PCT / 100
     closed_ratio = closed_qty / qty if qty > 0 else 0
@@ -139,6 +144,31 @@ def _manage_one_position(pos: dict, executor: BinanceLiveExecutor):
 
     # --- 更新当前价格和未实现盈亏 ---
     _update_price_and_pnl(pos, executor)
+
+
+def _repair_missing_stop(pos: dict, executor: BinanceLiveExecutor, open_qty: float):
+    pos_id = pos["id"]
+    now = time.time()
+    min_interval = getattr(config, "LIVE_STOP_REPAIR_MIN_INTERVAL_S", 10)
+    if now - _last_stop_repair_at.get(pos_id, 0) < min_interval:
+        return
+    _last_stop_repair_at[pos_id] = now
+
+    stop_price = float(pos.get("stop_loss_price") or 0)
+    if stop_price <= 0 or open_qty <= 0:
+        return
+
+    symbol = pos["symbol"]
+    result = executor.update_stop_loss(symbol, "", stop_price, open_qty)
+    if result.success:
+        with storage.get_conn() as conn:
+            storage.trade_position_update_exchange_stop(conn, pos_id, result.order_id)
+            storage.trade_position_update(conn, pos_id, {
+                "advice": f"止损已补挂 @ ${stop_price:.6g}",
+            })
+        _log(f"{pos['token']} 缺失止损已补挂 #{result.order_id}")
+    else:
+        _log(f"{pos['token']} 缺失止损补挂失败: {result.error}")
 
 
 def _handle_stop_loss_filled(pos: dict, executor: BinanceLiveExecutor):

@@ -443,12 +443,29 @@ def api_trading():
     """
     def compute():
         with storage.get_conn() as conn:
+            settings = storage.trading_settings_get(conn)
+            current_mode = settings.get("mode", "paper")
             account = trade_logic.account_summary(conn)
-            positions = storage.trade_positions_all(conn, limit=30)
+            positions = storage.trade_positions_by_mode(conn, current_mode, limit=30)
             leaderboard_items, _ = _build_leaderboard_items(conn)
             candidates = trade_logic.build_trade_candidates_from_leaderboard(
                 conn, leaderboard_items, passed_only=True)
             loss_archive = storage.trade_loss_archive_stats(conn)
+        active_tokens = {
+            str(p.get("token", "")).upper()
+            for p in positions
+            if p.get("status") in {"PENDING", "OPEN", "PARTIAL"}
+        }
+        for c in candidates:
+            c["has_active_position"] = str(c.get("token", "")).upper() in active_tokens
+        # PARTIAL 仓位的实时占用：margin_amount 是开仓快照不变，
+        # 实际占用按 (qty - closed_qty) / qty 比例计算。
+        # 同时附带 live_notional / remaining_ratio，前端可直接使用，
+        # 而 margin_amount / notional 保留用于历史复盘和 PnL% 基准。
+        for p in positions:
+            p["live_margin"] = trade_logic.position_live_margin(p)
+            p["live_notional"] = trade_logic.position_live_notional(p)
+            p["remaining_ratio"] = trade_logic.position_remaining_ratio(p)
         return {
             "account": account,
             "positions": positions,
@@ -901,7 +918,7 @@ tr.flash { animation: row-flash 1.5s ease-out; }
       <label>模式</label>
       <select id="trade-mode">
         <option value="paper">模拟</option>
-        <option value="live">实盘（暂未启用）</option>
+        <option value="live">实盘</option>
       </select>
     </div>
     <div>
@@ -1549,11 +1566,20 @@ function renderOpenPositions(items) {
     items.map(p => {
       const pnl = Number(p.pnl_pct || 0);
       const pnlCls = pnl >= 0 ? 'green' : 'red';
+      // PARTIAL 仓位显示"实时占用保证金"，PnL% 仍用初始 margin 做基准（更稳定）
+      const liveMargin = (p.live_margin !== undefined && p.live_margin !== null)
+        ? p.live_margin : p.margin_amount;
+      const ratio = (p.remaining_ratio !== undefined && p.remaining_ratio !== null)
+        ? p.remaining_ratio : 1;
+      const isPartial = ratio > 0 && ratio < 1;
+      const marginCell = isPartial
+        ? `${fmtUsdGlobal(liveMargin)} <span class="muted" style="font-size:11px;">(剩 ${(ratio*100).toFixed(0)}%)</span>`
+        : fmtUsdGlobal(liveMargin);
       return `<tr data-token="${p.token}">
         <td class="token">${p.token}</td>
         <td>${p.status}</td>
         <td class="right">${Number(p.leverage || 0).toFixed(0)}x</td>
-        <td class="right">${fmtUsdGlobal(p.margin_amount)}</td>
+        <td class="right">${marginCell}</td>
         <td class="right">${fmtPrice(p.entry_price || p.limit_price)}</td>
         <td class="right">${fmtPrice(p.current_price)}</td>
         <td class="right">${fmtPrice(p.stop_loss_price)}</td>
