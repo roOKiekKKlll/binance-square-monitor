@@ -54,7 +54,7 @@ class BinanceLiveExecutorStopFailureTests(unittest.TestCase):
         self.assertTrue(result.extra.get("stop_order_pending"))
         self.assertIn("timed out", result.extra.get("stop_error", ""))
 
-    def test_hard_stop_failure_still_emergency_closes(self):
+    def test_hard_stop_failure_keeps_position_for_manual_review(self):
         client = _FakeClient(BinanceAPIError(-1116, "Invalid orderType."))
         executor = BinanceLiveExecutor(client)
 
@@ -69,9 +69,11 @@ class BinanceLiveExecutorStopFailureTests(unittest.TestCase):
                 leverage=8,
             )
 
-        self.assertFalse(result.success)
-        self.assertEqual(client.market_sell_calls, 1)
-        self.assertIn("止损单挂失败", result.error)
+        self.assertTrue(result.success)
+        self.assertEqual(client.market_sell_calls, 0)
+        self.assertEqual(result.status, "STOP_PENDING")
+        self.assertTrue(result.extra.get("stop_order_pending"))
+        self.assertIn("Invalid orderType", result.extra.get("stop_error", ""))
 
 
 if __name__ == "__main__":

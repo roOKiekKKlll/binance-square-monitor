@@ -142,6 +142,7 @@ def test_manual_live_open_db_failure_triggers_emergency_close():
     from executor import BinanceLiveExecutor, OrderResult
 
     conn = _setup_db()
+    storage.trading_settings_update(conn, {"enabled": True, "mode": "live"})
     settings = {"leverage": 2}
 
     # 用假 key 初始化，确保 isinstance 判断与线上一致。
@@ -196,12 +197,66 @@ def test_manual_live_open_db_failure_triggers_emergency_close():
     print(f"OK DB 失败已触发紧急平仓: {symbol} qty={qty} reason={reason}")
 
 
+def test_live_open_failure_keeps_trading_enabled_but_signal_locked():
+    """实盘下单失败后保持自动交易开启，但保留 signal lock 避免同信号循环刷手续费。"""
+    import trade_logic
+    from executor import BinanceLiveExecutor, OrderResult
+
+    conn = _setup_db()
+    storage.trading_settings_update(conn, {"enabled": True, "mode": "live"})
+    settings = {"leverage": 2}
+    candidate = {
+        "token": "BTC",
+        "passed": True,
+        "has_active_position": False,
+        "tier": "half",
+        "price": 100.0,
+        "signal_key": "sig-live-fail",
+        "analysis_score": 80,
+        "pass_count": 6,
+    }
+
+    with patch.dict(os.environ, {"BINANCE_API_KEY": "test-key", "BINANCE_API_SECRET": "test-secret"}):
+        live_executor = BinanceLiveExecutor()
+    live_executor.open_long = lambda **kwargs: OrderResult(
+        success=False,
+        order_id="entry-123",
+        fill_price=100.0,
+        fill_qty=1.0,
+        error="止损单挂失败，已紧急平仓",
+    )
+
+    with patch("trade_logic.storage.trade_has_active", return_value=False), \
+         patch("trade_logic.get_klines_1h", return_value=[]), \
+         patch("trade_logic._build_account_context", return_value=SimpleNamespace(equity=1000.0, available_balance=1000.0)), \
+         patch("trade_logic.risk.check_account_risk", return_value=SimpleNamespace(allowed=True, reason="")), \
+         patch("trade_logic.risk.compute_stop_distance_pct", return_value=(-2.0, "fixed")), \
+         patch("trade_logic.risk.compute_position_size", return_value={
+             "quantity": 1.0,
+             "margin": 50.0,
+             "notional": 100.0,
+             "risk_amount": 2.0,
+             "stop_distance_pct": -2.0,
+         }), \
+         patch("trade_logic.storage.trade_open_positions", return_value=[]), \
+         patch("trade_logic.storage.trade_signal_lock_acquire", return_value=True), \
+         patch("trade_logic.storage.trade_signal_lock_release") as release:
+        result = trade_logic.open_position(conn, candidate, settings, live_executor)
+
+    assert result is False
+    release.assert_not_called()
+    persisted = storage.trading_settings_get(conn)
+    assert persisted["enabled"] is True, "实盘下单失败后不应自动关闭交易开关"
+    print("OK 实盘下单失败后保持交易开启并保留 signal lock，避免同信号循环下单")
+
+
 if __name__ == "__main__":
     tests = [
         test_tp2_can_trigger,
         test_stop_loss_with_slippage,
         test_tp1_already_done_not_retriggered,
         test_manual_live_open_db_failure_triggers_emergency_close,
+        test_live_open_failure_keeps_trading_enabled_but_signal_locked,
     ]
     failed = 0
     for t in tests:

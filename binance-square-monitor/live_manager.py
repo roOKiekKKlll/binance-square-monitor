@@ -45,7 +45,10 @@ def _get_order_status(executor: BinanceLiveExecutor, symbol: str, order_id: str)
     if not order_id:
         return "UNKNOWN"
     try:
-        resp = executor.client.get_order(symbol, int(order_id))
+        if executor.client.use_unified_account:
+            resp = executor.client.get_conditional_order_status(symbol, int(order_id))
+        else:
+            resp = executor.client.get_order(symbol, int(order_id))
         return resp.get("status", "UNKNOWN")
     except Exception:
         return "UNKNOWN"
@@ -147,6 +150,9 @@ def _manage_one_position(pos: dict, executor: BinanceLiveExecutor):
 
 
 def _repair_missing_stop(pos: dict, executor: BinanceLiveExecutor, open_qty: float):
+    if not getattr(config, "LIVE_AUTO_REPAIR_MISSING_STOP", False):
+        return
+
     pos_id = pos["id"]
     now = time.time()
     min_interval = getattr(config, "LIVE_STOP_REPAIR_MIN_INTERVAL_S", 10)
@@ -184,7 +190,10 @@ def _handle_stop_loss_filled(pos: dict, executor: BinanceLiveExecutor):
     # 查询止损单的实际成交价
     exit_price = float(pos.get("stop_loss_price") or 0)
     try:
-        order_info = executor.client.get_order(symbol, int(stop_oid))
+        if executor.client.use_unified_account:
+            order_info = executor.client.get_conditional_order_status(symbol, int(stop_oid))
+        else:
+            order_info = executor.client.get_order(symbol, int(stop_oid))
         exit_price = float(order_info.get("avgPrice", exit_price))
     except Exception:
         pass
@@ -227,7 +236,10 @@ def _handle_tp1_filled(pos: dict, executor: BinanceLiveExecutor, open_orders: li
     tp1_oid = pos.get("exchange_tp1_order_id", "")
     if tp1_oid:
         try:
-            order_info = executor.client.get_order(symbol, int(tp1_oid))
+            if executor.client.use_unified_account:
+                order_info = executor.client.get_conditional_order_status(symbol, int(tp1_oid))
+            else:
+                order_info = executor.client.get_order(symbol, int(tp1_oid))
             actual_fill = float(order_info.get("avgPrice", 0))
             if actual_fill > 0:
                 tp1_price = actual_fill
@@ -282,7 +294,10 @@ def _handle_tp2_filled(pos: dict, executor: BinanceLiveExecutor, open_orders: li
     tp2_oid = pos.get("exchange_tp2_order_id", "")
     if tp2_oid:
         try:
-            order_info = executor.client.get_order(symbol, int(tp2_oid))
+            if executor.client.use_unified_account:
+                order_info = executor.client.get_conditional_order_status(symbol, int(tp2_oid))
+            else:
+                order_info = executor.client.get_order(symbol, int(tp2_oid))
             actual_fill = float(order_info.get("avgPrice", 0))
             if actual_fill > 0:
                 tp2_price = actual_fill

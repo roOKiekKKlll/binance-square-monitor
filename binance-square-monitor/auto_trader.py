@@ -42,6 +42,7 @@ def _verify_live_api() -> bool:
         executor = get_executor("live")
         if isinstance(executor, BinanceLiveExecutor):
             balance = executor.get_account_balance()
+            executor.client.validate_live_order_routes()
             console.print(
                 f"[green]实盘 API 验证通过 — "
                 f"余额: ${balance.get('balance', 0):.2f} "

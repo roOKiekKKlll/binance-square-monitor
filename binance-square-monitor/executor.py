@@ -147,7 +147,7 @@ class BinanceLiveExecutor(OrderExecutor):
         2. 市价买入
         3. 确认成交后挂止损单
         4. 挂 TP1 止盈单
-        若止损单挂失败 → 重试 → 仍失败则市价平仓
+        若止损单挂失败 → 短重试 → 仍失败则返回 STOP_PENDING 让上层记录提醒
         """
         symbol = symbol.upper()
 
@@ -234,13 +234,9 @@ class BinanceLiveExecutor(OrderExecutor):
             symbol, fill_qty, stop_loss_price)
         stop_order_id = stop_result.order_id
         if not stop_order_id:
-            # 网络类失败通常是请求没收到响应，马上市价平仓会制造手续费和滑点。
-            # 这种情况先落库为待补挂止损，后续 live_manager 会继续补挂。
-            if (
-                stop_result.transient_failure
-                and not getattr(config, "LIVE_EMERGENCY_CLOSE_ON_STOP_TRANSIENT_FAILURE", False)
-            ):
-                _log(f"止损单因网络问题暂未确认，保留仓位并等待补挂 {symbol}: {stop_result.error}")
+            # 保护单失败后不反复开平仓制造手续费；把真实仓位落库并提醒人工检查。
+            if not getattr(config, "LIVE_EMERGENCY_CLOSE_ON_STOP_TRANSIENT_FAILURE", False):
+                _log(f"止损单暂未挂上，保留仓位并记录提醒 {symbol}: {stop_result.error}")
                 extra["stop_order_pending"] = True
                 extra["stop_error"] = stop_result.error
                 return OrderResult(
@@ -252,7 +248,7 @@ class BinanceLiveExecutor(OrderExecutor):
                     extra=extra,
                 )
 
-            # 参数错误/交易所明确拒绝 → 立即平仓保命
+            # 用户显式打开保命平仓时，才在保护单失败后立即平仓。
             _log(f"止损单挂失败，紧急平仓 {symbol}")
             try:
                 self.client.market_sell(symbol, fill_qty)
@@ -272,7 +268,9 @@ class BinanceLiveExecutor(OrderExecutor):
                 tp1_qty_rounded = self.client.round_quantity(symbol, tp1_qty)
                 tp1_resp = self.client.take_profit_market_sell(
                     symbol, tp1_qty_rounded, tp1_price)
-                tp1_order_id = str(tp1_resp.get("orderId") or tp1_resp.get("strategyId") or "")
+                tp1_order_id = str(
+                    tp1_resp.get("orderId") or tp1_resp.get("algoId") or tp1_resp.get("strategyId") or ""
+                )
                 extra["tp1_order_id"] = tp1_order_id
             except BinanceAPIError as e:
                 _log(f"TP1 止盈单挂失败（非致命）{symbol}: {e}")
@@ -312,7 +310,7 @@ class BinanceLiveExecutor(OrderExecutor):
         for attempt in range(retries):
             try:
                 resp = self.client.stop_market_sell(symbol, quantity, stop_price)
-                oid = str(resp.get("orderId") or resp.get("strategyId") or "")
+                oid = str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or "")
                 if oid:
                     return StopPlacementResult(order_id=oid)
             except BinanceAPIError as e:
@@ -397,7 +395,7 @@ class BinanceLiveExecutor(OrderExecutor):
             resp = self.client.take_profit_market_sell(symbol, quantity, price)
             return OrderResult(
                 success=True,
-                order_id=str(resp.get("orderId") or resp.get("strategyId") or ""),
+                order_id=str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or ""),
                 status=resp.get("status", "NEW"),
             )
         except BinanceAPIError as e:
@@ -407,7 +405,10 @@ class BinanceLiveExecutor(OrderExecutor):
         if not order_id:
             return True
         try:
-            self.client.cancel_order(symbol, int(order_id))
+            if self.client.use_unified_account:
+                self.client.cancel_conditional_order(symbol, int(order_id))
+            else:
+                self.client.cancel_order(symbol, int(order_id))
             return True
         except BinanceAPIError as e:
             # -2011: Unknown order / already canceled

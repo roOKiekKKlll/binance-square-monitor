@@ -111,7 +111,9 @@ class BinanceFuturesClient:
             "/fapi/v1/leverage",
             "/fapi/v1/margintype",
             "/papi/v1/um/order",
-            "/papi/v1/um/conditional/order",
+            "/papi/v1/um/algo/order",
+            "/papi/v1/um/algo/openAlgoOrders",
+            "/papi/v1/um/algo/allAlgoOrders",
             "/papi/v1/um/allopenorders",
             "/papi/v1/um/batchorders",
             "/papi/v1/um/leverage",
@@ -363,6 +365,78 @@ class BinanceFuturesClient:
         path = self._endpoint("/fapi/v2/positionRisk", "/papi/v1/um/positionRisk")
         return self._request("GET", path, params)
 
+    @staticmethod
+    def _is_html_404_error(err: BinanceAPIError) -> bool:
+        body = str(err.msg or "").lower()
+        return err.code == 404 and ("<!doctype html" in body or "<html" in body)
+
+    @staticmethod
+    def _is_permission_error(err: BinanceAPIError) -> bool:
+        return err.code in {-2015, -2014, -1002}
+
+    def _probe_invalid_order_route(self, path: str, params: dict, label: str) -> None:
+        """Probe a signed trade route without placing a real order.
+
+        PAPI has no order/test endpoint, so we use an intentionally invalid
+        symbol. A JSON validation error means auth and routing reached Binance;
+        HTML 404 or permission errors mean live trading is not safe to start.
+        """
+        try:
+            self._request("POST", path, params, signed=True, retries=1)
+        except BinanceAPIError as e:
+            if self._is_html_404_error(e):
+                raise RuntimeError(f"{label}接口不可用（HTML 404）: {e}") from e
+            if self._is_permission_error(e):
+                raise RuntimeError(f"{label}权限不可用: {e}") from e
+            return
+        raise RuntimeError(f"{label}探测请求意外成功，请立即检查是否产生了订单")
+
+    def validate_live_order_routes(self) -> None:
+        """Validate live order and protective-order routes before auto trading.
+
+        This intentionally avoids real symbols/orders for PAPI. It prevents the
+        bot from opening positions when stop-loss/take-profit endpoints are not
+        reachable for the current account/IP/API-key combination.
+        """
+        if self.use_unified_account:
+            self._probe_invalid_order_route(
+                "/papi/v1/um/order",
+                {
+                    "symbol": "NOTAREALUSDT",
+                    "side": "BUY",
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",
+                    "quantity": "0.001",
+                    "price": "1",
+                },
+                "统一账户下单",
+            )
+            self._probe_invalid_order_route(
+                "/papi/v1/um/algo/order",
+                {
+                    "symbol": "NOTAREALUSDT",
+                    "side": "SELL",
+                    "positionSide": self._long_position_side(),
+                    "algoType": "CONDITIONAL",
+                    "type": "STOP_MARKET",
+                    "quantity": "1",
+                    "triggerPrice": "1",
+                    "workingType": "MARK_PRICE",
+                },
+                "统一账户条件单",
+            )
+            return
+
+        # Standard UM futures provides a real test endpoint that never places orders.
+        self._request("POST", "/fapi/v1/order/test", {
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": "0.001",
+            "price": "1",
+        }, signed=True, retries=1)
+
     # === 杠杆 ===
 
     def set_leverage(self, symbol: str, leverage: int) -> dict:
@@ -398,9 +472,14 @@ class BinanceFuturesClient:
         return self._request("POST", path, clean)
 
     def place_conditional_order(self, **params) -> dict:
-        """Portfolio Margin UM 条件单。普通 futures 仍复用 /fapi/v1/order。"""
+        """Place protective conditional orders.
+
+        Portfolio Margin uses the current UM Algo endpoint. The older
+        /papi/v1/um/conditional/order endpoint is deprecated and may return
+        Binance's HTML 404 page.
+        """
         clean = {k: v for k, v in params.items() if v is not None}
-        path = self._endpoint("/fapi/v1/order", "/papi/v1/um/conditional/order")
+        path = self._endpoint("/fapi/v1/order", "/papi/v1/um/algo/order")
         return self._request("POST", path, clean)
 
     def market_buy(self, symbol: str, quantity: float) -> dict:
@@ -442,13 +521,15 @@ class BinanceFuturesClient:
             "side": "SELL",
             "positionSide": self._long_position_side(),
             "quantity": qty,
-            "stopPrice": sp,
             "workingType": "MARK_PRICE",
         }
         if self.use_unified_account:
-            params["strategyType"] = "STOP_MARKET"
+            params["algoType"] = "CONDITIONAL"
+            params["type"] = "STOP_MARKET"
+            params["triggerPrice"] = sp
         else:
             params["type"] = "STOP_MARKET"
+            params["stopPrice"] = sp
         reduce_only_value = self._reduce_only(True)
         if reduce_only_value is not None:
             params["reduceOnly"] = reduce_only_value
@@ -465,13 +546,15 @@ class BinanceFuturesClient:
             "side": "SELL",
             "positionSide": self._long_position_side(),
             "quantity": qty,
-            "stopPrice": sp,
             "workingType": "MARK_PRICE",
         }
         if self.use_unified_account:
-            params["strategyType"] = "TAKE_PROFIT_MARKET"
+            params["algoType"] = "CONDITIONAL"
+            params["type"] = "TAKE_PROFIT_MARKET"
+            params["triggerPrice"] = sp
         else:
             params["type"] = "TAKE_PROFIT_MARKET"
+            params["stopPrice"] = sp
         reduce_only_value = self._reduce_only(True)
         if reduce_only_value is not None:
             params["reduceOnly"] = reduce_only_value
@@ -495,7 +578,48 @@ class BinanceFuturesClient:
         if symbol:
             params["symbol"] = symbol.upper()
         path = self._endpoint("/fapi/v1/openOrders", "/papi/v1/um/openOrders")
-        return self._request("GET", path, params)
+        orders = self._request("GET", path, params)
+        if not self.use_unified_account:
+            return orders
+
+        algo_params = dict(params)
+        algo_params["algoType"] = "CONDITIONAL"
+        algo_orders = self._request("GET", "/papi/v1/um/algo/openAlgoOrders", algo_params)
+        merged = list(orders if isinstance(orders, list) else [])
+        for algo in algo_orders if isinstance(algo_orders, list) else []:
+            row = dict(algo)
+            row["orderId"] = int(row.get("algoId"))
+            row["status"] = row.get("algoStatus", "NEW")
+            row["type"] = row.get("orderType")
+            merged.append(row)
+        return merged
+
+    def get_conditional_order_status(self, symbol: str, algo_id: int) -> dict:
+        """Query current UM Algo order status by algoId."""
+        if not self.use_unified_account:
+            return self.get_order(symbol, algo_id)
+        rows = self._request("GET", "/papi/v1/um/algo/allAlgoOrders", {
+            "symbol": symbol.upper(),
+            "algoId": int(algo_id),
+            "limit": 1,
+        })
+        if isinstance(rows, list) and rows:
+            row = dict(rows[0])
+            status = row.get("algoStatus", "UNKNOWN")
+            mapped = {
+                "ACTIVE": "NEW",
+                "NEW": "NEW",
+                "CANCELED": "CANCELED",
+                "EXPIRED": "EXPIRED",
+                "TRIGGERED": "FILLED",
+                "FINISHED": "FILLED",
+            }.get(status, status)
+            row["orderId"] = int(row.get("algoId"))
+            row["status"] = mapped
+            row["avgPrice"] = row.get("actualPrice") or "0"
+            row["executedQty"] = row.get("quantity") or "0"
+            return row
+        return {"orderId": int(algo_id), "status": "UNKNOWN"}
 
     def cancel_order(self, symbol: str, order_id: int) -> dict:
         """DELETE /fapi/v1/order"""
@@ -506,12 +630,11 @@ class BinanceFuturesClient:
         })
 
     def cancel_conditional_order(self, symbol: str, strategy_id: int) -> dict:
-        """取消 PAPI UM 条件单；普通 futures 条件单仍是普通 order。"""
+        """取消条件单；普通 futures 条件单仍是普通 order。"""
         if not self.use_unified_account:
             return self.cancel_order(symbol, strategy_id)
-        return self._request("DELETE", "/papi/v1/um/conditional/order", {
-            "symbol": symbol.upper(),
-            "strategyId": int(strategy_id),
+        return self._request("DELETE", "/papi/v1/um/algo/order", {
+            "algoId": int(strategy_id),
         })
 
     def cancel_all_orders(self, symbol: str) -> dict:

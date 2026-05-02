@@ -27,7 +27,7 @@ class BinanceClientConfigTests(unittest.TestCase):
         self.assertIn("signature", signed)
 
     def test_proxy_from_env_supports_auth_tuple_format(self):
-        env = {"PROXY": "45.10.209.49:21412:user:pass"}
+        env = {"BINANCE_USE_PROXY": "true", "PROXY": "45.10.209.49:21412:user:pass"}
         with patch.object(BinanceFuturesClient, "_sync_server_time_offset", return_value=None):
             with patch.dict(os.environ, env, clear=False):
                 client = BinanceFuturesClient("k", "s")
@@ -35,6 +35,7 @@ class BinanceClientConfigTests(unittest.TestCase):
 
     def test_https_proxy_url_has_higher_priority(self):
         env = {
+            "BINANCE_USE_PROXY": "true",
             "PROXY": "45.10.209.49:21412:user:pass",
             "HTTPS_PROXY": "http://127.0.0.1:7890",
         }
@@ -65,7 +66,10 @@ class BinanceClientConfigTests(unittest.TestCase):
 
     def test_only_trade_related_signed_requests_use_proxy_opener(self):
         with patch.object(BinanceFuturesClient, "_sync_server_time_offset", return_value=None):
-            with patch.dict(os.environ, {"PROXY": "45.10.209.49:21412:user:pass"}, clear=False):
+            with patch.dict(os.environ, {
+                "BINANCE_USE_PROXY": "true",
+                "PROXY": "45.10.209.49:21412:user:pass",
+            }, clear=False):
                 client = BinanceFuturesClient("k", "s")
 
         direct_calls = []
@@ -95,7 +99,7 @@ class BinanceClientConfigTests(unittest.TestCase):
         client._request("GET", "/fapi/v1/exchangeInfo", signed=False, retries=1)
         client._request("GET", "/fapi/v2/account", signed=True, retries=1)
         client._request("POST", "/fapi/v1/order", {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": 0.001}, signed=True, retries=1)
-        client._request("POST", "/papi/v1/um/conditional/order", {"symbol": "BTCUSDT", "strategyType": "STOP_MARKET", "stopPrice": 1}, signed=True, retries=1)
+        client._request("POST", "/papi/v1/um/algo/order", {"symbol": "BTCUSDT", "algoType": "CONDITIONAL", "type": "STOP_MARKET", "triggerPrice": 1}, signed=True, retries=1)
         client._request("POST", "/papi/v1/um/leverage", {"symbol": "BTCUSDT", "leverage": 3}, signed=True, retries=1)
 
         self.assertEqual(len(direct_calls), 2)
@@ -180,7 +184,7 @@ class BinanceClientConfigTests(unittest.TestCase):
             self.assertEqual(params["positionSide"], "LONG")
             self.assertNotIn("reduceOnly", params)
 
-    def test_unified_stop_and_take_profit_use_conditional_order_endpoint(self):
+    def test_unified_stop_and_take_profit_use_algo_order_endpoint(self):
         env = {
             "BINANCE_DERIVATIVES_ACCOUNT_MODE": "unified",
             "BINANCE_POSITION_MODE": "hedge",
@@ -193,7 +197,7 @@ class BinanceClientConfigTests(unittest.TestCase):
 
         def _request(method, path, params, signed=True, retries=3, base_url=None):
             calls.append((method, path, params))
-            return {"strategyId": 123}
+            return {"algoId": 123}
 
         client._request = _request
 
@@ -202,16 +206,19 @@ class BinanceClientConfigTests(unittest.TestCase):
                 client.stop_market_sell("HYPEUSDT", 0.123, 38.5)
                 client.take_profit_market_sell("HYPEUSDT", 0.123, 42.0)
 
-        self.assertEqual(calls[0][1], "/papi/v1/um/conditional/order")
-        self.assertEqual(calls[0][2]["strategyType"], "STOP_MARKET")
-        self.assertNotIn("type", calls[0][2])
+        self.assertEqual(calls[0][1], "/papi/v1/um/algo/order")
+        self.assertEqual(calls[0][2]["algoType"], "CONDITIONAL")
+        self.assertEqual(calls[0][2]["type"], "STOP_MARKET")
+        self.assertEqual(calls[0][2]["triggerPrice"], 38.5)
+        self.assertNotIn("stopPrice", calls[0][2])
         self.assertEqual(calls[0][2]["positionSide"], "LONG")
         self.assertNotIn("reduceOnly", calls[0][2])
-        self.assertEqual(calls[1][1], "/papi/v1/um/conditional/order")
-        self.assertEqual(calls[1][2]["strategyType"], "TAKE_PROFIT_MARKET")
-        self.assertNotIn("type", calls[1][2])
+        self.assertEqual(calls[1][1], "/papi/v1/um/algo/order")
+        self.assertEqual(calls[1][2]["algoType"], "CONDITIONAL")
+        self.assertEqual(calls[1][2]["type"], "TAKE_PROFIT_MARKET")
+        self.assertEqual(calls[1][2]["triggerPrice"], 38.5)
 
-    def test_unified_cancel_conditional_order_uses_strategy_id_endpoint(self):
+    def test_unified_cancel_conditional_order_uses_algo_id_endpoint(self):
         env = {"BINANCE_DERIVATIVES_ACCOUNT_MODE": "unified"}
         with patch.object(BinanceFuturesClient, "_sync_server_time_offset", return_value=None):
             with patch.dict(os.environ, env, clear=False):
@@ -221,18 +228,46 @@ class BinanceClientConfigTests(unittest.TestCase):
 
         def _request(method, path, params, signed=True, retries=3, base_url=None):
             calls.append((method, path, params))
-            return {"strategyStatus": "CANCELED"}
+            return {"complete": True}
 
         client._request = _request
 
         resp = client.cancel_conditional_order("HYPEUSDT", 12345)
 
-        self.assertEqual(resp["strategyStatus"], "CANCELED")
+        self.assertTrue(resp["complete"])
         self.assertEqual(calls, [(
             "DELETE",
-            "/papi/v1/um/conditional/order",
-            {"symbol": "HYPEUSDT", "strategyId": 12345},
+            "/papi/v1/um/algo/order",
+            {"algoId": 12345},
         )])
+
+    def test_unified_open_orders_include_algo_orders(self):
+        with patch.object(BinanceFuturesClient, "_sync_server_time_offset", return_value=None):
+            with patch.dict(os.environ, {"BINANCE_DERIVATIVES_ACCOUNT_MODE": "unified"}, clear=False):
+                client = BinanceFuturesClient("k", "s")
+
+        calls = []
+
+        def _request(method, path, params, signed=True, retries=3, base_url=None):
+            calls.append((method, path, params))
+            if path == "/papi/v1/um/openOrders":
+                return []
+            if path == "/papi/v1/um/algo/openAlgoOrders":
+                return [{
+                    "algoId": 777,
+                    "algoStatus": "NEW",
+                    "orderType": "STOP_MARKET",
+                    "symbol": "HYPEUSDT",
+                }]
+            raise AssertionError(path)
+
+        client._request = _request
+
+        orders = client.get_open_orders("HYPEUSDT")
+
+        self.assertEqual(orders[0]["orderId"], 777)
+        self.assertEqual(orders[0]["status"], "NEW")
+        self.assertEqual(orders[0]["type"], "STOP_MARKET")
 
     def test_unified_balance_prefers_um_wallet_balance(self):
         with patch.object(BinanceFuturesClient, "_sync_server_time_offset", return_value=None):
@@ -342,6 +377,49 @@ class BinanceClientConfigTests(unittest.TestCase):
         self.assertTrue(signed)
         self.assertEqual(retries, 1)
         self.assertIn("下单参数校验", msg)
+
+    def test_validate_live_order_routes_rejects_unified_conditional_html_404(self):
+        with patch.object(BinanceFuturesClient, "_sync_server_time_offset", return_value=None):
+            with patch.dict(os.environ, {"BINANCE_DERIVATIVES_ACCOUNT_MODE": "unified"}, clear=False):
+                client = BinanceFuturesClient("k", "s")
+
+        calls = []
+
+        def _request(method, path, params, signed=True, retries=1):
+            calls.append((method, path, params))
+            if path == "/papi/v1/um/order":
+                raise BinanceAPIError(-1121, "Invalid symbol.")
+            if path == "/papi/v1/um/algo/order":
+                raise BinanceAPIError(404, "<!DOCTYPE html>")
+            raise AssertionError(f"unexpected path {path}")
+
+        client._request = _request
+
+        with self.assertRaisesRegex(RuntimeError, "条件单接口不可用"):
+            client.validate_live_order_routes()
+
+        self.assertEqual(calls[0][1], "/papi/v1/um/order")
+        self.assertEqual(calls[1][1], "/papi/v1/um/algo/order")
+
+    def test_validate_live_order_routes_accepts_invalid_symbol_validation_errors(self):
+        with patch.object(BinanceFuturesClient, "_sync_server_time_offset", return_value=None):
+            with patch.dict(os.environ, {"BINANCE_DERIVATIVES_ACCOUNT_MODE": "unified"}, clear=False):
+                client = BinanceFuturesClient("k", "s")
+
+        calls = []
+
+        def _request(method, path, params, signed=True, retries=1):
+            calls.append((method, path, params))
+            raise BinanceAPIError(-1121, "Invalid symbol.")
+
+        client._request = _request
+
+        client.validate_live_order_routes()
+
+        self.assertEqual([c[1] for c in calls], [
+            "/papi/v1/um/order",
+            "/papi/v1/um/algo/order",
+        ])
 
 
 if __name__ == "__main__":

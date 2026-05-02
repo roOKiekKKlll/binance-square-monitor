@@ -487,7 +487,7 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         _debug_reject(token, f"signal_lock 已占用 (signal_key={signal_key})", candidate)
         return False
 
-    # === 下单（从这里开始任何失败路径都必须释放 lock）===
+    # === 下单（paper 失败释放 lock；live 失败保留 lock，避免同信号循环刷手续费）===
     symbol = f"{token}USDT"
     tp1_qty = quantity * (config.TRADING_TP1_CLOSE_PCT / 100)
     try:
@@ -501,12 +501,14 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
             leverage=int(leverage),
         )
     except Exception as e:
-        storage.trade_signal_lock_release(conn, token, signal_key)
+        if not is_live:
+            storage.trade_signal_lock_release(conn, token, signal_key)
         _debug_reject(token, f"下单异常: {e}", candidate)
         raise
 
     if not order_result.success:
-        storage.trade_signal_lock_release(conn, token, signal_key)
+        if not is_live:
+            storage.trade_signal_lock_release(conn, token, signal_key)
         _debug_reject(token, f"下单失败: {order_result.error}", candidate)
         return False
 
@@ -551,7 +553,7 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
             f"风险 ${risk_amount:.2f} ({(risk_amount/account.equity*100) if account.equity else 0:.2f}% equity)"
         ),
         "advice": (
-            "⚠️ 止损因网络问题待补挂，live_manager 将继续重试"
+            f"⚠️ 保护单未挂上，请人工检查交易所；原因: {order_result.extra.get('stop_error', '')}"
             if stop_pending else
             f"{'满仓' if tier == 'full' else '半仓'}持有：等待 +{config.TRADING_TP1_R}R 止盈 / "
             f"{sizing.get('stop_distance_pct', 0):.2f}% 止损"
