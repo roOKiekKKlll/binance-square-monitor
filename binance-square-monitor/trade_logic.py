@@ -518,9 +518,10 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
 
     # 用实际成交价重新计算止盈止损
     if is_live and entry_price != estimated_entry:
+        stop_loss_price = entry_price * (1 + stop_pct / 100)
         risk_per_unit = entry_price - stop_loss_price
-        tp1_price = entry_price + abs(risk_per_unit) * config.TRADING_TP1_R
-        tp2_price = entry_price + abs(risk_per_unit) * config.TRADING_TP2_R
+        tp1_price = entry_price + risk_per_unit * config.TRADING_TP1_R
+        tp2_price = entry_price + risk_per_unit * config.TRADING_TP2_R
         notional = entry_price * actual_qty
         margin = notional / leverage
 
@@ -714,9 +715,10 @@ def manual_open_on_watch(conn, token: str, settings: dict, executor=None) -> dic
     actual_qty = order_result.fill_qty or quantity
 
     if is_live and entry_price != estimated_entry:
+        stop_loss_price = entry_price * (1 + stop_pct / 100)
         risk_per_unit = entry_price - stop_loss_price
-        tp1_price = entry_price + abs(risk_per_unit) * config.TRADING_TP1_R
-        tp2_price = entry_price + abs(risk_per_unit) * config.TRADING_TP2_R
+        tp1_price = entry_price + risk_per_unit * config.TRADING_TP1_R
+        tp2_price = entry_price + risk_per_unit * config.TRADING_TP2_R
         notional = entry_price * actual_qty
         margin = notional / leverage
 
