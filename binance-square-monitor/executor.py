@@ -16,6 +16,7 @@ from urllib.error import URLError
 
 import config
 from binance_client import BinanceFuturesClient, BinanceAPIError
+from market import get_mark_price
 
 
 def _log(msg: str):
@@ -308,13 +309,20 @@ class BinanceLiveExecutor(OrderExecutor):
         last_error = ""
         saw_transient = False
         for attempt in range(retries):
+            trigger_price = self._adjust_stop_price_below_mark(symbol, stop_price, attempt)
             try:
-                resp = self.client.stop_market_sell(symbol, quantity, stop_price)
+                resp = self.client.stop_market_sell(symbol, quantity, trigger_price)
                 oid = str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or "")
                 if oid:
                     return StopPlacementResult(order_id=oid)
             except BinanceAPIError as e:
                 last_error = str(e)
+                if e.code == -2021 and attempt < retries - 1:
+                    saw_transient = True
+                    _log(f"止损单触发价过近，刷新标记价后重试 {attempt+1}/{retries}: {e}")
+                    if attempt < retries - 1:
+                        time.sleep(delay)
+                    continue
                 if self._is_transient_stop_error(e):
                     saw_transient = True
                 else:
@@ -336,6 +344,54 @@ class BinanceLiveExecutor(OrderExecutor):
             transient_failure=saw_transient,
             error=last_error or "未返回止损订单号",
         )
+
+    @staticmethod
+    def _adjust_stop_price_below_mark(symbol: str, stop_price: float,
+                                      attempt: int = 0) -> float:
+        """Avoid Binance -2021 by keeping long stop triggers below current mark price."""
+        try:
+            token = symbol.upper()
+            if token.endswith("USDT"):
+                token = token[:-4]
+            mark = get_mark_price(token)
+            if not mark or mark <= 0:
+                return stop_price
+            if stop_price < mark:
+                return stop_price
+            buffer_pct = getattr(config, "LIVE_STOP_MARK_PRICE_BUFFER_PCT", 0.2)
+            buffer_pct *= (attempt + 1)
+            adjusted = mark * (1 - buffer_pct / 100)
+            _log(
+                f"止损价 {stop_price:.8g} 已不低于标记价 {mark:.8g}，"
+                f"下移到 {adjusted:.8g}"
+            )
+            return adjusted
+        except Exception as e:
+            _log(f"止损价标记价校验失败，使用原止损价: {e}")
+            return stop_price
+
+    @staticmethod
+    def _adjust_take_profit_price_above_mark(symbol: str, take_profit_price: float) -> float:
+        """Avoid immediate-trigger TP orders by keeping sell TP above current mark price."""
+        try:
+            token = symbol.upper()
+            if token.endswith("USDT"):
+                token = token[:-4]
+            mark = get_mark_price(token)
+            if not mark or mark <= 0:
+                return take_profit_price
+            if take_profit_price > mark:
+                return take_profit_price
+            buffer_pct = getattr(config, "LIVE_TAKE_PROFIT_MARK_PRICE_BUFFER_PCT", 0.2)
+            adjusted = mark * (1 + buffer_pct / 100)
+            _log(
+                f"止盈价 {take_profit_price:.8g} 已不高于标记价 {mark:.8g}，"
+                f"上移到 {adjusted:.8g}"
+            )
+            return adjusted
+        except Exception as e:
+            _log(f"止盈价标记价校验失败，使用原止盈价: {e}")
+            return take_profit_price
 
     def _poll_order_terminal(self, symbol: str, order_id: str,
                               timeout_s: float = 5.0,
@@ -392,7 +448,8 @@ class BinanceLiveExecutor(OrderExecutor):
 
     def place_take_profit(self, symbol: str, price: float, quantity: float) -> OrderResult:
         try:
-            resp = self.client.take_profit_market_sell(symbol, quantity, price)
+            trigger_price = self._adjust_take_profit_price_above_mark(symbol, price)
+            resp = self.client.take_profit_market_sell(symbol, quantity, trigger_price)
             return OrderResult(
                 success=True,
                 order_id=str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or ""),
