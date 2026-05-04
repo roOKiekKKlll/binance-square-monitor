@@ -112,6 +112,7 @@ TRADING_ATR_STOP_MULTIPLIER = 1.5        # 止损 = 1.5 × ATR
 TRADING_STOP_LOSS_PCT = -2.0             # 固定模式 或 ATR 回退时使用
 TRADING_STOP_LOSS_MIN_PCT = -1.2         # ATR 模式下止损下限（防止太紧）
 TRADING_STOP_LOSS_MAX_PCT = -5.0         # ATR 模式下止损上限（防止风险过大）
+TRADING_OPEN_MAX_LOSS_PCT = 3.5          # 仅 OPEN 初始止损生效：单笔最大允许亏损（%）
 
 # --- 止盈（基于 R 值阶梯）---
 # v2.3 改为"金字塔"结构：让赢家跑得更远，减少早砍仓

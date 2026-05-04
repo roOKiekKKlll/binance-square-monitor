@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import config
 import storage
 from executor import BinanceLiveExecutor
+from market import get_mark_price
 
 _last_reconcile_at = 0.0
 _last_trailing_update: dict[int, float] = {}  # pos_id → timestamp
@@ -588,18 +589,62 @@ def _do_reconcile(executor: BinanceLiveExecutor):
 
         # 交易所已无持仓但 DB 显示有 → 可能止损在离线时成交
         if exchange_qty == 0 and db_open_qty > 0:
-            _log(f"对账发现 {pos['token']} 交易所无持仓，DB 还有 {db_open_qty}，标记关闭")
+            _log(f"对账发现 {pos['token']} 交易所无持仓，DB 还有 {db_open_qty}，标记关闭并回填盈亏")
+            exit_price, advice = _resolve_reconcile_exit_price(executor, pos, symbol)
+            entry = float(pos.get("actual_entry_price") or pos.get("entry_price") or 0)
+            realized = float(pos.get("realized_pnl") or 0)
+            if exit_price and entry > 0:
+                realized += (float(exit_price) - entry) * db_open_qty
+            current_price = float(exit_price) if exit_price else float(pos.get("current_price") or 0)
             with storage.get_conn() as conn:
-                realized = float(pos.get("realized_pnl") or 0)
                 margin = float(pos.get("margin_amount") or 1)
                 storage.trade_position_update(conn, pos["id"], {
                     "status": "CLOSED",
+                    "current_price": current_price,
                     "closed_qty": float(pos.get("quantity", 0)),
+                    "realized_pnl": realized,
                     "unrealized_pnl": 0,
                     "pnl_pct": (realized / margin * 100) if margin else 0,
-                    "advice": "对账关闭：交易所已无持仓（可能离线期间止损成交）",
+                    "advice": advice,
                     "closed_at": "__CURRENT_TIMESTAMP__",
                 })
+
+
+def _resolve_reconcile_exit_price(
+    executor: BinanceLiveExecutor,
+    pos: dict,
+    symbol: str,
+) -> tuple[float | None, str]:
+    """Resolve best-effort exit price when reconcile finds position gone on exchange."""
+    order_candidates = [
+        ("止损", pos.get("exchange_stop_order_id")),
+        ("TP2", pos.get("exchange_tp2_order_id")),
+        ("TP1", pos.get("exchange_tp1_order_id")),
+    ]
+    for label, oid in order_candidates:
+        if not oid:
+            continue
+        try:
+            if executor.client.use_unified_account:
+                info = executor.client.get_conditional_order_status(symbol, int(oid))
+            else:
+                info = executor.client.get_order(symbol, int(oid))
+            status = str(info.get("status") or "").upper()
+            avg_price = float(info.get("avgPrice") or 0)
+            if status == "FILLED" and avg_price > 0:
+                return avg_price, f"对账关闭：{label}单已成交（离线补记）"
+        except Exception:
+            continue
+
+    mark = get_mark_price(pos.get("token") or "")
+    if mark and mark > 0:
+        return float(mark), "对账关闭：交易所已无持仓（按当前标记价估算）"
+
+    cached = float(pos.get("current_price") or 0)
+    if cached > 0:
+        return cached, "对账关闭：交易所已无持仓（按最后缓存价估算）"
+
+    return None, "对账关闭：交易所已无持仓（缺少成交价，PnL 未重算）"
 
 
 def emergency_close_all(executor: BinanceLiveExecutor) -> dict:
