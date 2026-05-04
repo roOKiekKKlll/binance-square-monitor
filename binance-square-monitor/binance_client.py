@@ -332,11 +332,13 @@ class BinanceFuturesClient:
                     um_wallet = float(item.get("umWalletBalance", 0) or 0)
                     cross_free = float(item.get("crossMarginFree", 0) or 0)
                     total_wallet = float(item.get("totalWalletBalance", 0) or 0)
-                    # 统一账户下，资金可能在 cross 维度而非 umWalletBalance。
-                    # 实盘下单的可用资金优先取 umWalletBalance，若为 0 则回退到 crossMarginFree。
-                    available = um_wallet if um_wallet > 0 else cross_free
-                    # 展示余额优先取可用资金，若仍为 0 再回退到 totalWalletBalance。
-                    wallet = available if available > 0 else total_wallet
+                    # 统一账户（PAPI）里，USDT 可能拆在 umWallet + crossMarginFree 两个维度。
+                    # 仅用 umWalletBalance 会低估可用资金，导致仓位被误判过小。
+                    available = um_wallet + cross_free
+                    if available <= 0:
+                        available = max(um_wallet, cross_free, total_wallet)
+                    # 余额展示优先总钱包余额（更贴近统一账户资产总览）。
+                    wallet = total_wallet if total_wallet > 0 else available
                     unrealized = float(item.get("umUnrealizedPNL", 0) or 0)
                     if unrealized == 0:
                         unrealized = float(item.get("crossUnPnl", 0) or 0)
