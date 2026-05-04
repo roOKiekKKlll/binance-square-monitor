@@ -23,6 +23,8 @@ from executor import BinanceLiveExecutor
 _last_reconcile_at = 0.0
 _last_trailing_update: dict[int, float] = {}  # pos_id → timestamp
 _last_stop_repair_at: dict[int, float] = {}   # pos_id → timestamp
+_last_guardian_at = 0.0
+_last_guard_repair_at: dict[tuple[int, str], float] = {}  # (pos_id, kind) -> timestamp
 
 
 def _log(msg: str):
@@ -69,7 +71,116 @@ def update_live_positions(executor: BinanceLiveExecutor):
         except Exception as e:
             _log(f"管理仓位 {pos.get('token')} 出错: {e}")
 
+    _maybe_guard_unprotected_orders(executor)
     _maybe_reconcile(executor)
+
+
+def _guard_repair_allowed(pos_id: int, kind: str) -> bool:
+    now = time.time()
+    min_interval = getattr(config, "LIVE_GUARDIAN_REPAIR_MIN_INTERVAL_S", 120)
+    key = (pos_id, kind)
+    if now - _last_guard_repair_at.get(key, 0) < min_interval:
+        return False
+    _last_guard_repair_at[key] = now
+    return True
+
+
+def _maybe_guard_unprotected_orders(executor: BinanceLiveExecutor):
+    global _last_guardian_at
+    if not getattr(config, "LIVE_GUARDIAN_ENABLED", True):
+        return
+
+    now = time.time()
+    interval = getattr(config, "LIVE_GUARDIAN_INTERVAL_S", 600)
+    if now - _last_guardian_at < interval:
+        return
+    _last_guardian_at = now
+
+    try:
+        with storage.get_conn() as conn:
+            positions = storage.trade_live_open_positions(conn)
+    except Exception as e:
+        _log(f"守护巡检读取仓位失败: {e}")
+        return
+
+    repaired = 0
+    for pos in positions:
+        try:
+            repaired += _repair_missing_protection_orders(pos, executor)
+        except Exception as e:
+            _log(f"守护巡检处理 {pos.get('token')} 失败: {e}")
+
+    if repaired > 0:
+        _log(f"守护巡检完成：本轮补挂 {repaired} 个保护单")
+
+
+def _repair_missing_protection_orders(pos: dict, executor: BinanceLiveExecutor) -> int:
+    pos_id = int(pos.get("id") or 0)
+    if pos_id <= 0:
+        return 0
+
+    symbol = pos.get("symbol") or ""
+    token = pos.get("token") or symbol
+    status = pos.get("status") or "OPEN"
+    qty = float(pos.get("quantity") or 0)
+    closed_qty = float(pos.get("closed_qty") or 0)
+    open_qty = max(qty - closed_qty, 0)
+    if not symbol or open_qty <= 0:
+        return 0
+
+    entry = float(pos.get("actual_entry_price") or pos.get("entry_price") or 0)
+    stop_price = float(pos.get("stop_loss_price") or 0)
+    tp1_price = float(pos.get("tp1_price") or 0)
+    tp2_price = float(pos.get("tp2_price") or 0)
+    stop_oid = pos.get("exchange_stop_order_id") or ""
+    tp1_oid = pos.get("exchange_tp1_order_id") or ""
+    tp2_oid = pos.get("exchange_tp2_order_id") or ""
+
+    tp1_pct = config.TRADING_TP1_CLOSE_PCT / 100
+    tp2_pct = config.TRADING_TP2_CLOSE_PCT / 100
+    closed_ratio = closed_qty / qty if qty > 0 else 0
+    tp1_done = closed_ratio >= tp1_pct - 1e-6
+    tp2_done = closed_ratio >= (tp1_pct + tp2_pct) - 1e-6
+
+    repaired = 0
+    fields = {}
+    notes = []
+
+    if not stop_oid and stop_price > 0 and _guard_repair_allowed(pos_id, "stop"):
+        result = executor.update_stop_loss(symbol, "", stop_price, open_qty)
+        if result.success and result.order_id:
+            fields["exchange_stop_order_id"] = result.order_id
+            repaired += 1
+            notes.append(f"止损已补挂 @ ${stop_price:.6g}")
+        else:
+            _log(f"{token} 守护补挂止损失败: {result.error}")
+
+    if (not tp1_done) and (not tp1_oid) and tp1_price > entry and _guard_repair_allowed(pos_id, "tp1"):
+        tp1_qty = min(qty * tp1_pct, open_qty)
+        tp1_result = executor.place_take_profit(symbol, tp1_price, tp1_qty)
+        if tp1_result.success and tp1_result.order_id:
+            fields["exchange_tp1_order_id"] = tp1_result.order_id
+            repaired += 1
+            notes.append(f"TP1 已补挂 @ ${tp1_price:.6g}")
+        else:
+            _log(f"{token} 守护补挂 TP1 失败: {tp1_result.error}")
+
+    if status == "PARTIAL" and tp1_done and (not tp2_done) and (not tp2_oid) and tp2_price > entry and _guard_repair_allowed(pos_id, "tp2"):
+        tp2_qty = min(qty * tp2_pct, open_qty)
+        tp2_result = executor.place_take_profit(symbol, tp2_price, tp2_qty)
+        if tp2_result.success and tp2_result.order_id:
+            fields["exchange_tp2_order_id"] = tp2_result.order_id
+            repaired += 1
+            notes.append(f"TP2 已补挂 @ ${tp2_price:.6g}")
+        else:
+            _log(f"{token} 守护补挂 TP2 失败: {tp2_result.error}")
+
+    if fields:
+        fields["advice"] = "；".join(notes)
+        with storage.get_conn() as conn:
+            storage.trade_position_update(conn, pos_id, fields)
+
+    return repaired
 
 
 def _manage_one_position(pos: dict, executor: BinanceLiveExecutor):

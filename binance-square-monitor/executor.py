@@ -265,16 +265,17 @@ class BinanceLiveExecutor(OrderExecutor):
         # 4. 挂 TP1 止盈单（非关键，失败不阻塞）
         tp1_order_id = None
         if tp1_qty > 0 and tp1_price > fill_price:
-            try:
-                tp1_qty_rounded = self.client.round_quantity(symbol, tp1_qty)
-                tp1_resp = self.client.take_profit_market_sell(
-                    symbol, tp1_qty_rounded, tp1_price)
-                tp1_order_id = str(
-                    tp1_resp.get("orderId") or tp1_resp.get("algoId") or tp1_resp.get("strategyId") or ""
-                )
+            tp1_result = self._place_take_profit_with_retry(
+                symbol=symbol,
+                price=tp1_price,
+                quantity=tp1_qty,
+                retries=getattr(config, "LIVE_TP_ORDER_RETRY_COUNT", 2),
+            )
+            if tp1_result.success and tp1_result.order_id:
+                tp1_order_id = tp1_result.order_id
                 extra["tp1_order_id"] = tp1_order_id
-            except BinanceAPIError as e:
-                _log(f"TP1 止盈单挂失败（非致命）{symbol}: {e}")
+            else:
+                _log(f"TP1 止盈单挂失败（非致命）{symbol}: {tp1_result.error}")
 
         return OrderResult(
             success=True,
@@ -371,7 +372,7 @@ class BinanceLiveExecutor(OrderExecutor):
             return stop_price
 
     @staticmethod
-    def _adjust_take_profit_price_above_mark(symbol: str, take_profit_price: float) -> float:
+    def _adjust_take_profit_price_above_mark(symbol: str, take_profit_price: float, attempt: int = 0) -> float:
         """Avoid immediate-trigger TP orders by keeping sell TP above current mark price."""
         try:
             token = symbol.upper()
@@ -383,6 +384,7 @@ class BinanceLiveExecutor(OrderExecutor):
             if take_profit_price > mark:
                 return take_profit_price
             buffer_pct = getattr(config, "LIVE_TAKE_PROFIT_MARK_PRICE_BUFFER_PCT", 0.2)
+            buffer_pct *= (attempt + 1)
             adjusted = mark * (1 + buffer_pct / 100)
             _log(
                 f"止盈价 {take_profit_price:.8g} 已不高于标记价 {mark:.8g}，"
@@ -392,6 +394,37 @@ class BinanceLiveExecutor(OrderExecutor):
         except Exception as e:
             _log(f"止盈价标记价校验失败，使用原止盈价: {e}")
             return take_profit_price
+
+    def _place_take_profit_with_retry(
+        self,
+        symbol: str,
+        price: float,
+        quantity: float,
+        retries: int = 1,
+    ) -> OrderResult:
+        rounded_qty = self.client.round_quantity(symbol, quantity)
+        if rounded_qty <= 0:
+            return OrderResult(success=False, error=f"止盈数量过小（round 后为 {rounded_qty}）")
+
+        retries = max(1, int(retries))
+        for attempt in range(retries):
+            trigger_price = self._adjust_take_profit_price_above_mark(symbol, price, attempt)
+            try:
+                resp = self.client.take_profit_market_sell(symbol, rounded_qty, trigger_price)
+                return OrderResult(
+                    success=True,
+                    order_id=str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or ""),
+                    status=resp.get("status", "NEW"),
+                )
+            except BinanceAPIError as e:
+                if e.code == -2021 and attempt < retries - 1:
+                    _log(f"止盈单触发价过近，重试 {attempt+1}/{retries}: {e}")
+                    continue
+                return OrderResult(success=False, error=f"止盈单失败: {e.msg}")
+            except Exception as e:
+                return OrderResult(success=False, error=f"止盈单失败: {e}")
+
+        return OrderResult(success=False, error="止盈单失败: 重试后仍失败")
 
     def _poll_order_terminal(self, symbol: str, order_id: str,
                               timeout_s: float = 5.0,
@@ -447,16 +480,7 @@ class BinanceLiveExecutor(OrderExecutor):
         return OrderResult(success=False, error=f"更新止损失败: {stop_result.error}")
 
     def place_take_profit(self, symbol: str, price: float, quantity: float) -> OrderResult:
-        try:
-            trigger_price = self._adjust_take_profit_price_above_mark(symbol, price)
-            resp = self.client.take_profit_market_sell(symbol, quantity, trigger_price)
-            return OrderResult(
-                success=True,
-                order_id=str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or ""),
-                status=resp.get("status", "NEW"),
-            )
-        except BinanceAPIError as e:
-            return OrderResult(success=False, error=f"止盈单失败: {e.msg}")
+        return self._place_take_profit_with_retry(symbol, price, quantity, retries=1)
 
     def cancel_order_safe(self, symbol: str, order_id: str) -> bool:
         if not order_id:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -62,6 +63,62 @@ def _pid_running(pid: int | None) -> bool:
         return False
 
 
+def _matching_script_pids(script: str) -> list[int]:
+    """Find running python PIDs whose command line targets this project script."""
+    script_path = str((BASE_DIR / script).resolve())
+    pids: list[int] = []
+    if os.name == "nt":
+        # PowerShell 输出: "<pid>|<commandline>"
+        ps = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -eq 'python.exe' } | "
+            "ForEach-Object { "
+            "$pid=$_.ProcessId; $cmd=$_.CommandLine; "
+            "if ($cmd) { Write-Output ($pid.ToString() + '|' + $cmd) } }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        # 宽松匹配：路径分隔符、大小写、引号差异都允许
+        pattern = re.escape(script_path).replace(r"\\", r"[\\/]")
+        rx = re.compile(pattern, re.IGNORECASE)
+        for line in result.stdout.splitlines():
+            if "|" not in line:
+                continue
+            pid_text, cmd = line.split("|", 1)
+            try:
+                pid = int(pid_text.strip())
+            except ValueError:
+                continue
+            if rx.search(cmd):
+                pids.append(pid)
+        return pids
+
+    result = subprocess.run(
+        ["pgrep", "-f", script_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    for line in result.stdout.splitlines():
+        try:
+            pids.append(int(line.strip()))
+        except ValueError:
+            continue
+    return pids
+
+
+def _find_running_program_pid(script: str) -> int | None:
+    """Pick one running pid for this script in this project."""
+    pids = [pid for pid in _matching_script_pids(script) if _pid_running(pid)]
+    return pids[0] if pids else None
+
+
 def _start_one(name: str, script: str) -> dict:
     path = BASE_DIR / script
     creationflags = 0
@@ -88,6 +145,16 @@ def start(open_browser: bool = True):
         old = state.get(name) or {}
         if _pid_running(old.get("pid")):
             print(f"{name}: already running pid={old['pid']}")
+            continue
+        existing_pid = _find_running_program_pid(script)
+        if existing_pid:
+            state[name] = {
+                "pid": existing_pid,
+                "script": script,
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            changed = True
+            print(f"{name}: detected existing pid={existing_pid} (adopted)")
             continue
         info = _start_one(name, script)
         state[name] = info
@@ -134,6 +201,12 @@ def stop():
             print(f"{name}: stopped pid={pid}")
         else:
             print(f"{name}: not running pid={pid}")
+
+    # 兜底清理：即使不在 PID_FILE，也把本项目脚本残留进程杀掉，避免双实例。
+    for name, script in reversed(PROGRAMS):
+        for pid in _matching_script_pids(script):
+            if _stop_pid(int(pid)):
+                print(f"{name}: cleaned residual pid={pid}")
 
     if PID_FILE.exists():
         PID_FILE.unlink()
