@@ -176,7 +176,7 @@ def compute_position_size(
     if config.TRADING_SIZING_MODE == "fixed_margin":
         margin = float(config.TRADING_ORDER_AMOUNT)
         if tier == "half":
-            margin *= 0.5
+            margin *= float(getattr(config, "TRADING_FIXED_MARGIN_HALF_MULTIPLIER", 0.5))
         notional = margin * leverage
         quantity = notional / entry_price
         risk_amount = (entry_price - stop_price) * quantity
