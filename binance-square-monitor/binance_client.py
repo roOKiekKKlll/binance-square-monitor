@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+from decimal import Decimal
 from typing import Optional
 from urllib.parse import urlencode
 from urllib.request import Request, ProxyHandler, build_opener
@@ -191,10 +192,31 @@ class BinanceFuturesClient:
         params["signature"] = signature
         return params
 
+    @staticmethod
+    def _format_decimal(value: float | Decimal) -> str:
+        """Format price/qty without scientific notation for Binance."""
+        text = format(Decimal(str(value)), "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        if text in {"", "-0"}:
+            return "0"
+        return text
+
+    def _normalize_request_params(self, params: dict) -> dict:
+        normalized: dict = {}
+        for key, value in params.items():
+            if isinstance(value, bool):
+                normalized[key] = value
+            elif isinstance(value, (float, Decimal)):
+                normalized[key] = self._format_decimal(value)
+            else:
+                normalized[key] = value
+        return normalized
+
     def _request(self, method: str, path: str, params: dict | None = None,
                  signed: bool = True, retries: int = 3,
                  base_url: str | None = None) -> dict | list:
-        base_params = dict(params or {})
+        base_params = self._normalize_request_params(dict(params or {}))
         url = f"{base_url or self._api_base()}{path}"
 
         headers = {
