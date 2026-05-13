@@ -39,6 +39,7 @@ class OrderResult:
 @dataclass
 class StopPlacementResult:
     order_id: str | None = None
+    trigger_price: float | None = None
     transient_failure: bool = False
     error: str = ""
 
@@ -55,18 +56,27 @@ class OrderExecutor(ABC):
         ...
 
     @abstractmethod
-    def close_position(self, symbol: str, quantity: float, reason: str = "") -> OrderResult:
+    def open_short(self, symbol: str, quantity: float, entry_price: float,
+                   stop_loss_price: float, tp1_price: float, tp1_qty: float,
+                   leverage: int) -> OrderResult:
+        """开空：下卖单 + 挂止损 + 挂 TP1。返回实际成交结果。"""
+        ...
+
+    @abstractmethod
+    def close_position(self, symbol: str, quantity: float, side: str = "LONG",
+                       reason: str = "") -> OrderResult:
         """市价平仓（部分或全部）"""
         ...
 
     @abstractmethod
     def update_stop_loss(self, symbol: str, old_order_id: str,
-                         new_stop_price: float, quantity: float) -> OrderResult:
+                         new_stop_price: float, quantity: float, side: str = "LONG") -> OrderResult:
         """撤旧止损挂新止损"""
         ...
 
     @abstractmethod
-    def place_take_profit(self, symbol: str, price: float, quantity: float) -> OrderResult:
+    def place_take_profit(self, symbol: str, price: float, quantity: float,
+                          side: str = "LONG") -> OrderResult:
         """挂止盈单"""
         ...
 
@@ -109,16 +119,28 @@ class PaperExecutor(OrderExecutor):
             status="FILLED",
         )
 
-    def close_position(self, symbol, quantity, reason="") -> OrderResult:
+    def open_short(self, symbol, quantity, entry_price, stop_loss_price,
+                   tp1_price, tp1_qty, leverage) -> OrderResult:
+        slippage = entry_price * config.TRADING_ASSUMED_SLIPPAGE_PCT / 100
+        fill_price = max(entry_price - slippage, 0)
+        return OrderResult(
+            success=True,
+            order_id=self._next_id(),
+            fill_price=fill_price,
+            fill_qty=quantity,
+            status="FILLED",
+        )
+
+    def close_position(self, symbol, quantity, side="LONG", reason="") -> OrderResult:
         return OrderResult(
             success=True, order_id=self._next_id(),
             fill_qty=quantity, status="FILLED",
         )
 
-    def update_stop_loss(self, symbol, old_order_id, new_stop_price, quantity) -> OrderResult:
+    def update_stop_loss(self, symbol, old_order_id, new_stop_price, quantity, side="LONG") -> OrderResult:
         return OrderResult(success=True, order_id=self._next_id(), status="NEW")
 
-    def place_take_profit(self, symbol, price, quantity) -> OrderResult:
+    def place_take_profit(self, symbol, price, quantity, side="LONG") -> OrderResult:
         return OrderResult(success=True, order_id=self._next_id(), status="NEW")
 
     def cancel_order_safe(self, symbol, order_id) -> bool:
@@ -138,6 +160,34 @@ class BinanceLiveExecutor(OrderExecutor):
 
     def __init__(self, client: BinanceFuturesClient | None = None):
         self.client = client or BinanceFuturesClient()
+
+    @staticmethod
+    def _cap_stop_price_by_open_loss(entry_price: float, stop_price: float,
+                                     side: str = "LONG") -> float:
+        """Clamp stop so initial OPEN risk never exceeds TRADING_OPEN_MAX_LOSS_PCT."""
+        if entry_price <= 0 or stop_price <= 0:
+            return stop_price
+        side = (side or "LONG").upper()
+        max_loss_pct = float(getattr(config, "TRADING_OPEN_MAX_LOSS_PCT", 0) or 0)
+        if max_loss_pct <= 0:
+            return stop_price
+        if side == "SHORT":
+            ceiling = entry_price * (1 + max_loss_pct / 100.0)
+            if stop_price > ceiling:
+                _log(
+                    f"止损价 {stop_price:.8g} 超过 OPEN 最大亏损 {max_loss_pct:.2f}% 限制，"
+                    f"下调到 {ceiling:.8g}"
+                )
+                return ceiling
+            return stop_price
+        floor = entry_price * (1 - max_loss_pct / 100.0)
+        if stop_price < floor:
+            _log(
+                f"止损价 {stop_price:.8g} 超过 OPEN 最大亏损 {max_loss_pct:.2f}% 限制，"
+                f"上调到 {floor:.8g}"
+            )
+            return floor
+        return stop_price
 
     def open_long(self, symbol: str, quantity: float, entry_price: float,
                   stop_loss_price: float, tp1_price: float, tp1_qty: float,
@@ -226,13 +276,23 @@ class BinanceLiveExecutor(OrderExecutor):
                 f"— 继续为已成交部分挂止损保护"
             )
 
-        # 用实际成交价重新计算止损止盈价格
-        # (因为市价单的实际成交价可能和预期价格有偏差)
+        # 用实际成交价重新锚定止损（保持同一止损百分比），并强制遵守 OPEN 最大亏损上限。
+        # 避免“DB 显示 5%，交易所真实挂单 >5%”的偏差。
         extra = {"entry_order_id": order_id}
+        effective_stop_price = stop_loss_price
+        if entry_price > 0 and stop_loss_price > 0 and fill_price > 0:
+            stop_pct = (stop_loss_price - entry_price) / entry_price * 100.0
+            effective_stop_price = fill_price * (1 + stop_pct / 100.0)
+        effective_stop_price = self._cap_stop_price_by_open_loss(fill_price, effective_stop_price, side="LONG")
 
         # 3. 挂止损单（最关键 — 必须成功）
         stop_result = self._place_stop_with_retry(
-            symbol, fill_qty, stop_loss_price)
+            symbol=symbol,
+            quantity=fill_qty,
+            stop_price=effective_stop_price,
+            entry_price=fill_price,
+            side="LONG",
+        )
         stop_order_id = stop_result.order_id
         if not stop_order_id:
             # 保护单失败后不反复开平仓制造手续费；把真实仓位落库并提醒人工检查。
@@ -252,7 +312,7 @@ class BinanceLiveExecutor(OrderExecutor):
             # 用户显式打开保命平仓时，才在保护单失败后立即平仓。
             _log(f"止损单挂失败，紧急平仓 {symbol}")
             try:
-                self.client.market_sell(symbol, fill_qty)
+                self.client.market_sell(symbol, fill_qty, reduce_only=True, position_side=self.client._long_position_side())
             except Exception as e2:
                 _log(f"紧急平仓也失败了！{symbol}: {e2}")
             return OrderResult(
@@ -261,6 +321,8 @@ class BinanceLiveExecutor(OrderExecutor):
                 error="止损单挂失败，已紧急平仓",
             )
         extra["stop_order_id"] = stop_order_id
+        if stop_result.trigger_price and stop_result.trigger_price > 0:
+            extra["placed_stop_price"] = stop_result.trigger_price
 
         # 4. 挂 TP1 止盈单（非关键，失败不阻塞）
         tp1_order_id = None
@@ -270,12 +332,132 @@ class BinanceLiveExecutor(OrderExecutor):
                 price=tp1_price,
                 quantity=tp1_qty,
                 retries=getattr(config, "LIVE_TP_ORDER_RETRY_COUNT", 2),
+                side="LONG",
             )
             if tp1_result.success and tp1_result.order_id:
                 tp1_order_id = tp1_result.order_id
                 extra["tp1_order_id"] = tp1_order_id
             else:
                 _log(f"TP1 止盈单挂失败（非致命）{symbol}: {tp1_result.error}")
+
+        return OrderResult(
+            success=True,
+            order_id=order_id,
+            fill_price=fill_price,
+            fill_qty=fill_qty,
+            status="FILLED",
+            extra=extra,
+        )
+
+    def open_short(self, symbol: str, quantity: float, entry_price: float,
+                   stop_loss_price: float, tp1_price: float, tp1_qty: float,
+                   leverage: int) -> OrderResult:
+        symbol = symbol.upper()
+        try:
+            self.client.set_margin_type(symbol, "CROSSED")
+        except BinanceAPIError as e:
+            if e.code != -4046:
+                _log(f"设置保证金模式失败 {symbol}: {e}")
+                return OrderResult(success=False, error=f"设置保证金模式失败: {e.msg}")
+        try:
+            self.client.set_leverage(symbol, leverage)
+        except BinanceAPIError as e:
+            _log(f"设置杠杆失败 {symbol}: {e}")
+            return OrderResult(success=False, error=f"设置杠杆失败: {e.msg}")
+
+        try:
+            entry_resp = self.client.market_sell(
+                symbol, quantity, reduce_only=False, position_side=self.client._short_position_side()
+            )
+        except BinanceAPIError as e:
+            _log(f"市价卖出开空失败 {symbol}: {e}")
+            return OrderResult(success=False, error=f"开空失败: {e.msg}")
+
+        order_id = str(entry_resp.get("orderId", ""))
+        fill_price = float(entry_resp.get("avgPrice", 0) or 0)
+        fill_qty = float(entry_resp.get("executedQty", 0) or 0)
+        status = entry_resp.get("status", "")
+        TERMINAL = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
+        if status not in TERMINAL and order_id:
+            final = self._poll_order_terminal(symbol, order_id)
+            if final:
+                status = final.get("status", status)
+                final_fill_price = float(final.get("avgPrice", 0) or 0)
+                final_fill_qty = float(final.get("executedQty", 0) or 0)
+                if final_fill_price > 0:
+                    fill_price = final_fill_price
+                if final_fill_qty > 0:
+                    fill_qty = final_fill_qty
+        if fill_price <= 0 and fill_qty > 0 and order_id:
+            try:
+                detail = self.client.get_order(symbol, int(order_id))
+                fill_price = float(detail.get("avgPrice", 0) or 0)
+            except Exception:
+                pass
+        if fill_qty <= 0:
+            if order_id and status in ("NEW", "PARTIALLY_FILLED"):
+                try:
+                    self.client.cancel_order(symbol, int(order_id))
+                except Exception:
+                    pass
+            return OrderResult(
+                success=False, order_id=order_id,
+                fill_price=fill_price, fill_qty=fill_qty, status=status,
+                error=f"开空未成交: {status}",
+            )
+
+        extra = {"entry_order_id": order_id}
+        effective_stop_price = stop_loss_price
+        if entry_price > 0 and stop_loss_price > 0 and fill_price > 0:
+            stop_pct = (stop_loss_price - entry_price) / entry_price * 100.0
+            effective_stop_price = fill_price * (1 + stop_pct / 100.0)
+        effective_stop_price = self._cap_stop_price_by_open_loss(fill_price, effective_stop_price, side="SHORT")
+
+        stop_result = self._place_stop_with_retry(
+            symbol=symbol,
+            quantity=fill_qty,
+            stop_price=effective_stop_price,
+            entry_price=fill_price,
+            side="SHORT",
+        )
+        stop_order_id = stop_result.order_id
+        if not stop_order_id:
+            if not getattr(config, "LIVE_EMERGENCY_CLOSE_ON_STOP_TRANSIENT_FAILURE", False):
+                extra["stop_order_pending"] = True
+                extra["stop_error"] = stop_result.error
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    fill_price=fill_price,
+                    fill_qty=fill_qty,
+                    status="STOP_PENDING",
+                    extra=extra,
+                )
+            try:
+                self.client.market_buy(
+                    symbol, fill_qty, reduce_only=True, position_side=self.client._short_position_side()
+                )
+            except Exception:
+                pass
+            return OrderResult(
+                success=False, order_id=order_id,
+                fill_price=fill_price, fill_qty=fill_qty,
+                error="止损单挂失败，已紧急平仓",
+            )
+        extra["stop_order_id"] = stop_order_id
+        if stop_result.trigger_price and stop_result.trigger_price > 0:
+            extra["placed_stop_price"] = stop_result.trigger_price
+
+        if tp1_qty > 0 and tp1_price < fill_price:
+            tp1_result = self._place_take_profit_with_retry(
+                symbol=symbol,
+                price=tp1_price,
+                quantity=tp1_qty,
+                retries=getattr(config, "LIVE_TP_ORDER_RETRY_COUNT", 2),
+                side="SHORT",
+            )
+            if tp1_result.success and tp1_result.order_id:
+                extra["tp1_order_id"] = tp1_result.order_id
 
         return OrderResult(
             success=True,
@@ -296,8 +478,14 @@ class BinanceLiveExecutor(OrderExecutor):
             return err.code in {-1000, -1001, -1006, -1007}
         return False
 
-    def _place_stop_with_retry(self, symbol: str, quantity: float,
-                                stop_price: float) -> StopPlacementResult:
+    def _place_stop_with_retry(
+        self,
+        symbol: str,
+        quantity: float,
+        stop_price: float,
+        entry_price: float | None = None,
+        side: str = "LONG",
+    ) -> StopPlacementResult:
         """挂止损单，失败重试。网络类错误返回 pending，硬错误返回失败。"""
         retries = getattr(
             config, "LIVE_STOP_ORDER_RETRY_COUNT",
@@ -309,13 +497,30 @@ class BinanceLiveExecutor(OrderExecutor):
         )
         last_error = ""
         saw_transient = False
+        side = (side or "LONG").upper()
         for attempt in range(retries):
-            trigger_price = self._adjust_stop_price_below_mark(symbol, stop_price, attempt)
+            if side == "SHORT":
+                trigger_price = self._adjust_stop_price_above_mark(
+                    symbol=symbol,
+                    stop_price=stop_price,
+                    attempt=attempt,
+                    entry_price=entry_price,
+                )
+            else:
+                trigger_price = self._adjust_stop_price_below_mark(
+                    symbol=symbol,
+                    stop_price=stop_price,
+                    attempt=attempt,
+                    entry_price=entry_price,
+                )
             try:
-                resp = self.client.stop_market_sell(symbol, quantity, trigger_price)
+                if side == "SHORT":
+                    resp = self.client.stop_market_buy(symbol, quantity, trigger_price)
+                else:
+                    resp = self.client.stop_market_sell(symbol, quantity, trigger_price)
                 oid = str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or "")
                 if oid:
-                    return StopPlacementResult(order_id=oid)
+                    return StopPlacementResult(order_id=oid, trigger_price=trigger_price)
             except BinanceAPIError as e:
                 last_error = str(e)
                 if e.code == -2021 and attempt < retries - 1:
@@ -347,13 +552,22 @@ class BinanceLiveExecutor(OrderExecutor):
         )
 
     @staticmethod
-    def _adjust_stop_price_below_mark(symbol: str, stop_price: float,
-                                      attempt: int = 0) -> float:
+    def _adjust_stop_price_below_mark(
+        symbol: str,
+        stop_price: float,
+        attempt: int = 0,
+        entry_price: float | None = None,
+    ) -> float:
         """Avoid Binance -2021 by keeping long stop triggers below current mark price."""
         try:
             token = symbol.upper()
             if token.endswith("USDT"):
                 token = token[:-4]
+            stop_price = BinanceLiveExecutor._cap_stop_price_by_open_loss(
+                float(entry_price or 0),
+                stop_price,
+                side="LONG",
+            )
             mark = get_mark_price(token)
             if not mark or mark <= 0:
                 return stop_price
@@ -362,9 +576,53 @@ class BinanceLiveExecutor(OrderExecutor):
             buffer_pct = getattr(config, "LIVE_STOP_MARK_PRICE_BUFFER_PCT", 0.2)
             buffer_pct *= (attempt + 1)
             adjusted = mark * (1 - buffer_pct / 100)
+            adjusted = BinanceLiveExecutor._cap_stop_price_by_open_loss(
+                float(entry_price or 0),
+                adjusted,
+                side="LONG",
+            )
             _log(
                 f"止损价 {stop_price:.8g} 已不低于标记价 {mark:.8g}，"
                 f"下移到 {adjusted:.8g}"
+            )
+            return adjusted
+        except Exception as e:
+            _log(f"止损价标记价校验失败，使用原止损价: {e}")
+            return stop_price
+
+    @staticmethod
+    def _adjust_stop_price_above_mark(
+        symbol: str,
+        stop_price: float,
+        attempt: int = 0,
+        entry_price: float | None = None,
+    ) -> float:
+        """Avoid Binance -2021 by keeping short stop triggers above current mark price."""
+        try:
+            token = symbol.upper()
+            if token.endswith("USDT"):
+                token = token[:-4]
+            stop_price = BinanceLiveExecutor._cap_stop_price_by_open_loss(
+                float(entry_price or 0),
+                stop_price,
+                side="SHORT",
+            )
+            mark = get_mark_price(token)
+            if not mark or mark <= 0:
+                return stop_price
+            if stop_price > mark:
+                return stop_price
+            buffer_pct = getattr(config, "LIVE_STOP_MARK_PRICE_BUFFER_PCT", 0.2)
+            buffer_pct *= (attempt + 1)
+            adjusted = mark * (1 + buffer_pct / 100)
+            adjusted = BinanceLiveExecutor._cap_stop_price_by_open_loss(
+                float(entry_price or 0),
+                adjusted,
+                side="SHORT",
+            )
+            _log(
+                f"止损价 {stop_price:.8g} 已不高于标记价 {mark:.8g}，"
+                f"上移到 {adjusted:.8g}"
             )
             return adjusted
         except Exception as e:
@@ -401,16 +659,24 @@ class BinanceLiveExecutor(OrderExecutor):
         price: float,
         quantity: float,
         retries: int = 1,
+        side: str = "LONG",
     ) -> OrderResult:
         rounded_qty = self.client.round_quantity(symbol, quantity)
         if rounded_qty <= 0:
             return OrderResult(success=False, error=f"止盈数量过小（round 后为 {rounded_qty}）")
 
         retries = max(1, int(retries))
+        side = (side or "LONG").upper()
         for attempt in range(retries):
-            trigger_price = self._adjust_take_profit_price_above_mark(symbol, price, attempt)
+            if side == "SHORT":
+                trigger_price = self._adjust_take_profit_price_below_mark(symbol, price, attempt)
+            else:
+                trigger_price = self._adjust_take_profit_price_above_mark(symbol, price, attempt)
             try:
-                resp = self.client.take_profit_market_sell(symbol, rounded_qty, trigger_price)
+                if side == "SHORT":
+                    resp = self.client.take_profit_market_buy(symbol, rounded_qty, trigger_price)
+                else:
+                    resp = self.client.take_profit_market_sell(symbol, rounded_qty, trigger_price)
                 return OrderResult(
                     success=True,
                     order_id=str(resp.get("orderId") or resp.get("algoId") or resp.get("strategyId") or ""),
@@ -425,6 +691,30 @@ class BinanceLiveExecutor(OrderExecutor):
                 return OrderResult(success=False, error=f"止盈单失败: {e}")
 
         return OrderResult(success=False, error="止盈单失败: 重试后仍失败")
+
+    @staticmethod
+    def _adjust_take_profit_price_below_mark(symbol: str, take_profit_price: float, attempt: int = 0) -> float:
+        """Avoid immediate-trigger TP orders by keeping short TP below current mark price."""
+        try:
+            token = symbol.upper()
+            if token.endswith("USDT"):
+                token = token[:-4]
+            mark = get_mark_price(token)
+            if not mark or mark <= 0:
+                return take_profit_price
+            if take_profit_price < mark:
+                return take_profit_price
+            buffer_pct = getattr(config, "LIVE_TAKE_PROFIT_MARK_PRICE_BUFFER_PCT", 0.2)
+            buffer_pct *= (attempt + 1)
+            adjusted = mark * (1 - buffer_pct / 100)
+            _log(
+                f"止盈价 {take_profit_price:.8g} 已不低于标记价 {mark:.8g}，"
+                f"下移到 {adjusted:.8g}"
+            )
+            return adjusted
+        except Exception as e:
+            _log(f"止盈价标记价校验失败，使用原止盈价: {e}")
+            return take_profit_price
 
     def _poll_order_terminal(self, symbol: str, order_id: str,
                               timeout_s: float = 5.0,
@@ -455,9 +745,18 @@ class BinanceLiveExecutor(OrderExecutor):
             time.sleep(interval_s)
         return last_detail
 
-    def close_position(self, symbol: str, quantity: float, reason: str = "") -> OrderResult:
+    def close_position(self, symbol: str, quantity: float, side: str = "LONG",
+                       reason: str = "") -> OrderResult:
         try:
-            resp = self.client.market_sell(symbol, quantity)
+            side = (side or "LONG").upper()
+            if side == "SHORT":
+                resp = self.client.market_buy(
+                    symbol, quantity, reduce_only=True, position_side=self.client._short_position_side()
+                )
+            else:
+                resp = self.client.market_sell(
+                    symbol, quantity, reduce_only=True, position_side=self.client._long_position_side()
+                )
             return OrderResult(
                 success=True,
                 order_id=str(resp.get("orderId", "")),
@@ -469,18 +768,19 @@ class BinanceLiveExecutor(OrderExecutor):
             return OrderResult(success=False, error=f"平仓失败: {e.msg}")
 
     def update_stop_loss(self, symbol: str, old_order_id: str,
-                         new_stop_price: float, quantity: float) -> OrderResult:
+                         new_stop_price: float, quantity: float, side: str = "LONG") -> OrderResult:
         """撤旧止损，挂新止损"""
         # 先撤旧单
         self.cancel_order_safe(symbol, old_order_id)
         # 挂新止损
-        stop_result = self._place_stop_with_retry(symbol, quantity, new_stop_price)
+        stop_result = self._place_stop_with_retry(symbol, quantity, new_stop_price, side=side)
         if stop_result.order_id:
             return OrderResult(success=True, order_id=stop_result.order_id, status="NEW")
         return OrderResult(success=False, error=f"更新止损失败: {stop_result.error}")
 
-    def place_take_profit(self, symbol: str, price: float, quantity: float) -> OrderResult:
-        return self._place_take_profit_with_retry(symbol, price, quantity, retries=1)
+    def place_take_profit(self, symbol: str, price: float, quantity: float,
+                          side: str = "LONG") -> OrderResult:
+        return self._place_take_profit_with_retry(symbol, price, quantity, retries=1, side=side)
 
     def cancel_order_safe(self, symbol: str, order_id: str) -> bool:
         if not order_id:

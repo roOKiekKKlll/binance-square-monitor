@@ -89,6 +89,9 @@ class BinanceFuturesClient:
     def _long_position_side(self) -> str | None:
         return "LONG" if self.use_hedge_mode else None
 
+    def _short_position_side(self) -> str | None:
+        return "SHORT" if self.use_hedge_mode else None
+
     def _reduce_only(self, value: bool) -> str | None:
         # Binance hedge mode rejects reduceOnly on UM orders; positionSide=LONG
         # is enough to make SELL orders reduce the long leg.
@@ -506,28 +509,34 @@ class BinanceFuturesClient:
         path = self._endpoint("/fapi/v1/order", "/papi/v1/um/algo/order")
         return self._request("POST", path, clean)
 
-    def market_buy(self, symbol: str, quantity: float) -> dict:
-        """市价做多"""
+    def market_buy(self, symbol: str, quantity: float, reduce_only: bool = False,
+                   position_side: str | None = None) -> dict:
+        """市价买入（开多/平空）"""
         qty = self.round_quantity(symbol, quantity)
         if qty <= 0:
             raise BinanceAPIError(-1, f"数量精度修正后为 0（原始: {quantity}）")
-        return self.place_order(
-            symbol=symbol.upper(),
-            side="BUY",
-            positionSide=self._long_position_side(),
-            type="MARKET",
-            quantity=qty,
-        )
+        params = {
+            "symbol": symbol.upper(),
+            "side": "BUY",
+            "positionSide": position_side if position_side is not None else self._long_position_side(),
+            "type": "MARKET",
+            "quantity": qty,
+        }
+        reduce_only_value = self._reduce_only(reduce_only)
+        if reduce_only_value is not None:
+            params["reduceOnly"] = reduce_only_value
+        return self.place_order(**params)
 
-    def market_sell(self, symbol: str, quantity: float, reduce_only: bool = True) -> dict:
-        """市价卖出（平多）"""
+    def market_sell(self, symbol: str, quantity: float, reduce_only: bool = True,
+                    position_side: str | None = None) -> dict:
+        """市价卖出（平多/开空）"""
         qty = self.round_quantity(symbol, quantity)
         if qty <= 0:
             raise BinanceAPIError(-1, f"数量精度修正后为 0（原始: {quantity}）")
         params = {
             "symbol": symbol.upper(),
             "side": "SELL",
-            "positionSide": self._long_position_side(),
+            "positionSide": position_side if position_side is not None else self._long_position_side(),
             "type": "MARKET",
             "quantity": qty,
         }
@@ -561,6 +570,31 @@ class BinanceFuturesClient:
             return self.place_conditional_order(**params)
         return self.place_order(**params)
 
+    def stop_market_buy(self, symbol: str, quantity: float, stop_price: float) -> dict:
+        """止损单（空头）：价格到 stop_price 时市价买入"""
+        qty = self.round_quantity(symbol, quantity)
+        sp = self.round_price(symbol, stop_price)
+        params = {
+            "symbol": symbol.upper(),
+            "side": "BUY",
+            "positionSide": self._short_position_side(),
+            "quantity": qty,
+            "workingType": "MARK_PRICE",
+        }
+        if self.use_unified_account:
+            params["algoType"] = "CONDITIONAL"
+            params["type"] = "STOP_MARKET"
+            params["triggerPrice"] = sp
+        else:
+            params["type"] = "STOP_MARKET"
+            params["stopPrice"] = sp
+        reduce_only_value = self._reduce_only(True)
+        if reduce_only_value is not None:
+            params["reduceOnly"] = reduce_only_value
+        if self.use_unified_account:
+            return self.place_conditional_order(**params)
+        return self.place_order(**params)
+
     def take_profit_market_sell(self, symbol: str, quantity: float, stop_price: float) -> dict:
         """止盈单：价格到 stop_price 时市价卖出"""
         qty = self.round_quantity(symbol, quantity)
@@ -569,6 +603,31 @@ class BinanceFuturesClient:
             "symbol": symbol.upper(),
             "side": "SELL",
             "positionSide": self._long_position_side(),
+            "quantity": qty,
+            "workingType": "MARK_PRICE",
+        }
+        if self.use_unified_account:
+            params["algoType"] = "CONDITIONAL"
+            params["type"] = "TAKE_PROFIT_MARKET"
+            params["triggerPrice"] = sp
+        else:
+            params["type"] = "TAKE_PROFIT_MARKET"
+            params["stopPrice"] = sp
+        reduce_only_value = self._reduce_only(True)
+        if reduce_only_value is not None:
+            params["reduceOnly"] = reduce_only_value
+        if self.use_unified_account:
+            return self.place_conditional_order(**params)
+        return self.place_order(**params)
+
+    def take_profit_market_buy(self, symbol: str, quantity: float, stop_price: float) -> dict:
+        """止盈单（空头）：价格到 stop_price 时市价买入"""
+        qty = self.round_quantity(symbol, quantity)
+        sp = self.round_price(symbol, stop_price)
+        params = {
+            "symbol": symbol.upper(),
+            "side": "BUY",
+            "positionSide": self._short_position_side(),
             "quantity": qty,
             "workingType": "MARK_PRICE",
         }

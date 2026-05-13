@@ -8,4 +8,13 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-.venv\Scripts\python.exe manage_processes.py start
+echo [INFO] Restarting monitor processes to reload latest config...
+.venv\Scripts\python.exe manage_processes.py restart
+if errorlevel 1 (
+    echo [ERROR] Failed to restart processes.
+    pause
+    exit /b 1
+)
+
+echo [INFO] Current process status:
+.venv\Scripts\python.exe manage_processes.py status

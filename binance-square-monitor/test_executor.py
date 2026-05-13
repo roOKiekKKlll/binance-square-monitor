@@ -76,5 +76,60 @@ class BinanceLiveExecutorStopFailureTests(unittest.TestCase):
         self.assertIn("Invalid orderType", result.extra.get("stop_error", ""))
 
 
+class _FakeClientCaptureStop:
+    def __init__(self, fill_price=110.0):
+        self.fill_price = fill_price
+        self.last_stop_price = None
+
+    def set_margin_type(self, symbol, margin_type):
+        return {"ok": True}
+
+    def set_leverage(self, symbol, leverage):
+        return {"ok": True}
+
+    def market_buy(self, symbol, quantity):
+        return {
+            "orderId": 2001,
+            "avgPrice": str(self.fill_price),
+            "executedQty": str(quantity),
+            "status": "FILLED",
+        }
+
+    def stop_market_sell(self, symbol, quantity, stop_price):
+        self.last_stop_price = float(stop_price)
+        return {"orderId": 2002, "status": "NEW"}
+
+    def round_quantity(self, symbol, quantity):
+        return quantity
+
+    def take_profit_market_sell(self, symbol, quantity, stop_price):
+        return {"orderId": 2003, "status": "NEW"}
+
+
+class BinanceLiveExecutorStopPriceTests(unittest.TestCase):
+    def test_stop_is_reanchored_to_fill_and_capped_by_open_max_loss(self):
+        client = _FakeClientCaptureStop(fill_price=110.0)
+        executor = BinanceLiveExecutor(client)
+
+        with patch("executor.get_mark_price", return_value=100.0), \
+             patch("executor.config.TRADING_OPEN_MAX_LOSS_PCT", 5.0, create=True):
+            result = executor.open_long(
+                symbol="BTCUSDT",
+                quantity=1.0,
+                entry_price=100.0,
+                stop_loss_price=95.0,  # 期望 -5%
+                tp1_price=120.0,
+                tp1_qty=0.0,
+                leverage=5,
+            )
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(client.last_stop_price)
+        # 若不修复，这里会因 mark=100 下移到 99.8（约 -9.27%）。
+        # 修复后应受 5% 上限保护：110 * 0.95 = 104.5。
+        self.assertAlmostEqual(client.last_stop_price, 104.5, places=6)
+        self.assertAlmostEqual(result.extra.get("placed_stop_price"), 104.5, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

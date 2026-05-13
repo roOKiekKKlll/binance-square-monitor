@@ -147,6 +147,7 @@ def compute_position_size(
     stop_price: float,
     leverage: float,
     tier: Literal["full", "half"] = "full",
+    side: Literal["LONG", "SHORT"] = "LONG",
 ) -> dict:
     """
     基于风险反推仓位。
@@ -161,8 +162,15 @@ def compute_position_size(
     返回：{"quantity", "notional", "margin", "risk_amount", "stop_distance_pct", "note"}
     若无法下单返回 {"quantity": 0, "note": "原因"}
     """
-    if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
-        return {"quantity": 0, "note": "stop_price 不合法（>=entry）"}
+    if entry_price <= 0 or stop_price <= 0:
+        return {"quantity": 0, "note": "价格不合法（<=0）"}
+    side = (side or "LONG").upper()
+    if side not in {"LONG", "SHORT"}:
+        return {"quantity": 0, "note": f"side 不合法 ({side})"}
+    if side == "LONG" and stop_price >= entry_price:
+        return {"quantity": 0, "note": "LONG stop_price 不合法（>=entry）"}
+    if side == "SHORT" and stop_price <= entry_price:
+        return {"quantity": 0, "note": "SHORT stop_price 不合法（<=entry）"}
 
     risk_pct = config.TRADING_RISK_PER_TRADE_PCT / 100.0
     if tier == "half":
@@ -179,7 +187,7 @@ def compute_position_size(
             margin *= float(getattr(config, "TRADING_FIXED_MARGIN_HALF_MULTIPLIER", 0.5))
         notional = margin * leverage
         quantity = notional / entry_price
-        risk_amount = (entry_price - stop_price) * quantity
+        risk_amount = abs(entry_price - stop_price) * quantity
         stop_distance_pct = (stop_price - entry_price) / entry_price * 100
         return {
             "quantity": quantity,
@@ -192,7 +200,7 @@ def compute_position_size(
 
     # risk_based（默认）
     risk_amount = equity * risk_pct
-    per_unit_risk = entry_price - stop_price  # > 0
+    per_unit_risk = abs(entry_price - stop_price)  # > 0
     quantity = risk_amount / per_unit_risk
     notional = quantity * entry_price
     margin = notional / leverage

@@ -63,6 +63,16 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
     watch_set = set(t.upper() for t in (watchlist or []))
     updated = 0
     archived_tokens = []
+    benchmark = str(getattr(config, "TRADING_REGIME_BENCHMARK_TOKEN", "BTC") or "BTC").upper()
+    benchmark_diag = {
+        "seen": False,
+        "written": False,
+        "reason": "未处理",
+        "mark_price": None,
+        "change_1h_pct": None,
+        "change_4h_pct": None,
+        "oi_change_1h_pct": None,
+    }
 
     # Step 1：一次性读好需要的基础数据（短事务）
     with storage.get_conn() as conn:
@@ -72,7 +82,11 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
     # Step 2：逐个 token 处理，网络请求在事务外，写库用独立小事务
     for token in tokens_to_check:
         up = token.upper()
+        if up == benchmark:
+            benchmark_diag["seen"] = True
         if up not in futures_set:
+            if up == benchmark:
+                benchmark_diag["reason"] = "无永续合约（未在 futures symbol 列表中）"
             continue
 
         # === 网络请求（事务外，不占 DB 锁）===
@@ -80,8 +94,12 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
             snap = get_market_snapshot(token)
         except Exception as e:
             console.print(f"   [dim][red]{token} 抓取失败: {e}[/red][/dim]")
+            if up == benchmark:
+                benchmark_diag["reason"] = f"抓取失败: {e}"
             continue
         if not snap:
+            if up == benchmark:
+                benchmark_diag["reason"] = "抓取返回空快照"
             continue
 
         social_score = social_map.get(token, 0.0)
@@ -89,6 +107,8 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
             analysis = analyze_signals(snap, social_score)
         except Exception as e:
             console.print(f"   [dim][red]{token} 分析失败: {e}[/red][/dim]")
+            if up == benchmark:
+                benchmark_diag["reason"] = f"分析失败: {e}"
             continue
 
         snap_json = json.dumps(snap, default=str, ensure_ascii=False)
@@ -122,8 +142,17 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
                                 storage.archive_loss_sample(conn, up, cur_price, pnl)
                                 archived_tokens.append((up, pnl))
             updated += 1
+            if up == benchmark:
+                benchmark_diag["written"] = True
+                benchmark_diag["reason"] = "ok"
+                benchmark_diag["mark_price"] = snap.get("mark_price")
+                benchmark_diag["change_1h_pct"] = snap.get("change_1h_pct")
+                benchmark_diag["change_4h_pct"] = snap.get("change_4h_pct")
+                benchmark_diag["oi_change_1h_pct"] = snap.get("oi_change_1h_pct")
         except Exception as e:
             console.print(f"   [dim][red]{token} 入库失败: {e}[/red][/dim]")
+            if up == benchmark:
+                benchmark_diag["reason"] = f"入库失败: {e}"
             continue
 
         # 节流（事务外，web 读取不受影响）
@@ -132,6 +161,38 @@ def refresh_market_snapshots(tokens_to_check: list[str], watchlist: list[str] = 
     if archived_tokens:
         for t, pnl in archived_tokens:
             console.print(f"   [yellow]⚠ {t} 浮亏 {pnl:.1f}% 已归档为学习样本[/yellow]")
+
+    if benchmark_diag["seen"]:
+        if benchmark_diag["written"]:
+            ch1h = benchmark_diag["change_1h_pct"]
+            ch4h = benchmark_diag["change_4h_pct"]
+            oi1h = benchmark_diag["oi_change_1h_pct"]
+            missing = []
+            if ch1h is None:
+                missing.append("change_1h_pct")
+            if ch4h is None:
+                missing.append("change_4h_pct")
+            if oi1h is None:
+                missing.append("oi_change_1h_pct")
+            if missing:
+                console.print(
+                    f"[yellow]   Regime 基准 {benchmark} 已写入，但字段缺失: {', '.join(missing)}"
+                    f" | mark={benchmark_diag['mark_price']}[/yellow]"
+                )
+            else:
+                console.print(
+                    f"[green]   Regime 基准 {benchmark} 已写入"
+                    f" | mark={benchmark_diag['mark_price']}"
+                    f" | 1h={ch1h:+.2f}% 4h={ch4h:+.2f}% OI1h={oi1h:+.2f}%[/green]"
+                )
+        else:
+            console.print(
+                f"[red]   Regime 基准 {benchmark} 本轮未写入: {benchmark_diag['reason']}[/red]"
+            )
+    else:
+        console.print(
+            f"[yellow]   Regime 基准 {benchmark} 不在本轮刷新列表（请检查组合逻辑）[/yellow]"
+        )
 
     return updated
 
@@ -291,7 +352,8 @@ async def one_round(scraper: SquareScraper):
     # ============================================================
     if config.ENABLE_MARKET_ANALYSIS:
         top_tokens = [s["token"] for s in short_scores[:config.MARKET_ANALYSIS_MAX]]
-        combined = list(dict.fromkeys(top_tokens + watchlist))
+        benchmark = str(getattr(config, "TRADING_REGIME_BENCHMARK_TOKEN", "BTC") or "BTC").upper()
+        combined = list(dict.fromkeys(top_tokens + watchlist + [benchmark]))
         _write_status(
             stage="market",
             detail=f"查询合约数据（榜单 {len(top_tokens)} + 观察 {len(watchlist)} = {len(combined)} 代币）",

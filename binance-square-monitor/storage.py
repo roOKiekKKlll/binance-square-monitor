@@ -634,6 +634,7 @@ def trading_settings_defaults() -> dict:
         "initial_balance": config.TRADING_INITIAL_BALANCE,
         "leverage": config.TRADING_LEVERAGE,
         "order_amount": config.TRADING_ORDER_AMOUNT,
+        "regime_filter_enabled": config.TRADING_REGIME_FILTER_ENABLED,
     }
 
 
@@ -642,7 +643,7 @@ def trading_settings_get(conn) -> dict:
     rows = conn.execute("SELECT key, value FROM trading_settings").fetchall()
     for row in rows:
         raw = row["value"]
-        if row["key"] in {"enabled"}:
+        if row["key"] in {"enabled", "regime_filter_enabled"}:
             settings[row["key"]] = str(raw).lower() in {"1", "true", "yes", "on"}
         elif row["key"] in {"initial_balance", "leverage", "order_amount"}:
             try:
@@ -656,7 +657,7 @@ def trading_settings_get(conn) -> dict:
 
 
 def trading_settings_update(conn, fields: dict):
-    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount"}
+    allowed = {"enabled", "mode", "initial_balance", "leverage", "order_amount", "regime_filter_enabled"}
     rows = []
     for key, value in fields.items():
         if key in allowed:
@@ -696,6 +697,25 @@ def trade_positions_by_mode(conn, mode: str, limit: int = 50) -> list[dict]:
         LIMIT ?
     """, (mode, limit))
     return [dict(r) for r in cur.fetchall()]
+
+
+def trade_positions_for_panel(conn, mode: str, closed_limit: int = 30) -> list[dict]:
+    """交易面板专用：
+    - 活跃仓位（PENDING/OPEN/PARTIAL）全量返回，避免老仓位被 LIMIT 截断。
+    - 已平仓只返回最近 closed_limit 条，控制前端体积。
+    """
+    active = conn.execute("""
+        SELECT * FROM trade_positions
+        WHERE mode = ? AND status IN ('PENDING', 'OPEN', 'PARTIAL')
+        ORDER BY id DESC
+    """, (mode,)).fetchall()
+    closed = conn.execute("""
+        SELECT * FROM trade_positions
+        WHERE mode = ? AND status NOT IN ('PENDING', 'OPEN', 'PARTIAL')
+        ORDER BY id DESC
+        LIMIT ?
+    """, (mode, closed_limit)).fetchall()
+    return [dict(r) for r in active] + [dict(r) for r in closed]
 
 
 def trade_has_active(conn, token: str) -> bool:

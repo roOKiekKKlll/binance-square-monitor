@@ -8,5 +8,10 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
+echo [INFO] Stopping monitor processes...
 .venv\Scripts\python.exe manage_processes.py stop
+
+echo [INFO] Current process status:
+.venv\Scripts\python.exe manage_processes.py status
+
 pause

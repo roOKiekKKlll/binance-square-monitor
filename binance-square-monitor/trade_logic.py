@@ -125,11 +125,126 @@ def _fmt_num(value: float | None, digits: int = 2) -> str:
     return "-" if value is None else f"{value:.{digits}f}"
 
 
+def _is_benchmark_token_excluded(token: str) -> bool:
+    benchmark = str(getattr(config, "TRADING_REGIME_BENCHMARK_TOKEN", "BTC") or "BTC").upper()
+    exclude_benchmark = bool(getattr(config, "TRADING_REGIME_EXCLUDE_BENCHMARK_FROM_TRADING", True))
+    return exclude_benchmark and token.upper() == benchmark
+
+
+def _evaluate_market_regime(conn, settings: dict | None = None) -> dict:
+    """市场状态过滤（可开关）。
+
+    返回:
+      {
+        "enabled": bool,
+        "state": "trend" | "neutral" | "risk_off" | "disabled",
+        "allow_open": bool,
+        "reason": str,
+      }
+    """
+    bench = str(getattr(config, "TRADING_REGIME_BENCHMARK_TOKEN", "BTC") or "BTC").upper()
+    if settings is None:
+        try:
+            settings = storage.trading_settings_get(conn)
+        except Exception:
+            settings = {}
+    enabled = settings.get(
+        "regime_filter_enabled",
+        getattr(config, "TRADING_REGIME_FILTER_ENABLED", False),
+    )
+    if not enabled:
+        return {
+            "enabled": False,
+            "benchmark_token": bench,
+            "state": "disabled",
+            "allow_open": True,
+            "reason": "regime_filter_off",
+        }
+    market = _load_market(conn, bench)
+    snap = market.get("snapshot") or {}
+    ch1h = _pct(snap.get("change_1h_pct"))
+    ch4h = _pct(snap.get("change_4h_pct"))
+    oi1h = _pct(snap.get("oi_change_1h_pct"))
+
+    if ch1h is None or ch4h is None or oi1h is None:
+        return {
+            "enabled": True,
+            "benchmark_token": bench,
+            "state": "neutral",
+            "allow_open": False,
+            "reason": f"{bench} 行情数据不足（1h/4h/OI1h）",
+        }
+
+    risk_off_1h = float(getattr(config, "TRADING_REGIME_RISK_OFF_1H_PCT", -1.5))
+    risk_off_4h = float(getattr(config, "TRADING_REGIME_RISK_OFF_4H_PCT", -4.0))
+    trend_min_1h = float(getattr(config, "TRADING_REGIME_TREND_MIN_1H_PCT", 0.2))
+    trend_min_4h = float(getattr(config, "TRADING_REGIME_TREND_MIN_4H_PCT", 0.8))
+    trend_min_oi_1h = float(getattr(config, "TRADING_REGIME_TREND_MIN_OI_1H_PCT", -1.0))
+
+    if ch1h <= risk_off_1h or ch4h <= risk_off_4h:
+        return {
+            "enabled": True,
+            "benchmark_token": bench,
+            "state": "risk_off",
+            "allow_open": False,
+            "reason": (
+                f"{bench} risk_off: 1h={ch1h:+.2f}% 4h={ch4h:+.2f}% "
+                f"(阈值 {risk_off_1h:+.2f}%/{risk_off_4h:+.2f}%)"
+            ),
+        }
+
+    is_trend = (
+        ch1h >= trend_min_1h and
+        ch4h >= trend_min_4h and
+        oi1h >= trend_min_oi_1h
+    )
+    if is_trend:
+        return {
+            "enabled": True,
+            "benchmark_token": bench,
+            "state": "trend",
+            "allow_open": True,
+            "reason": (
+                f"{bench} trend: 1h={ch1h:+.2f}% 4h={ch4h:+.2f}% OI1h={oi1h:+.2f}%"
+            ),
+        }
+
+    return {
+        "enabled": True,
+        "benchmark_token": bench,
+        "state": "neutral",
+        "allow_open": False,
+        "reason": (
+            f"{bench} neutral: 1h={ch1h:+.2f}% 4h={ch4h:+.2f}% OI1h={oi1h:+.2f}% "
+            f"(趋势阈值 {trend_min_1h:+.2f}%/{trend_min_4h:+.2f}%/{trend_min_oi_1h:+.2f}%)"
+        ),
+    }
+
+
+def market_regime_status(conn, settings: dict | None = None) -> dict:
+    """公开给 web/监控面板使用的当前市场状态。"""
+    return _evaluate_market_regime(conn, settings=settings)
+
+
 def _margin_pnl_pct(realized: float, unrealized: float, margin: float) -> float:
     return ((realized + unrealized) / (margin or 1)) * 100
 
 
-def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict) -> dict:
+def _realized_delta(side: str, entry: float, exit_price: float, qty: float) -> float:
+    side = (side or "LONG").upper()
+    if side == "SHORT":
+        return (entry - exit_price) * qty
+    return (exit_price - entry) * qty
+
+
+def evaluate_candidate(
+    conn,
+    score_row: dict,
+    rank: int,
+    market: dict,
+    realtime: dict,
+    regime: dict | None = None,
+) -> dict:
     """
     评估一个候选币是否可以开仓。
 
@@ -149,6 +264,9 @@ def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict)
     signal_score = analysis.get("score")
 
     quality = risk.evaluate_entry_quality(snap, realtime, signal_score, verdict)
+    if regime is None:
+        regime = _evaluate_market_regime(conn)
+    side = "LONG"
 
     tier = quality["tier"]
     passed = tier != "skip"
@@ -176,6 +294,28 @@ def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict)
     if quality["hard_block"]:
         suggestion = "不追高"
 
+    if regime.get("enabled"):
+        state = regime.get("state")
+        if state == "risk_off":
+            # risk_off 下将榜单信号切到开空模式（仍要求有可用价格）
+            side = "SHORT"
+            if price is not None and price > 0:
+                passed = True
+                if tier == "skip":
+                    tier = "full"
+                suggestion = "可开空（Regime risk_off）"
+                reasons.insert(0, f"OK 市场状态过滤: {regime.get('reason')} -> 切换开空")
+            else:
+                passed = False
+                tier = "skip"
+                suggestion = "观察（市场状态过滤）"
+                reasons.insert(0, f"⛔ 市场状态过滤: {regime.get('reason')}")
+        elif not regime.get("allow_open"):
+            passed = False
+            tier = "skip"
+            suggestion = "观察（市场状态过滤）"
+            reasons.insert(0, f"⛔ 市场状态过滤: {regime.get('reason')}")
+
     return {
         "token": token,
         "rank": rank,
@@ -190,6 +330,8 @@ def evaluate_candidate(score_row: dict, rank: int, market: dict, realtime: dict)
         "market": market,
         "realtime": realtime,
         "analysis_score": signal_score,
+        "market_regime": regime,
+        "side": side,
     }
 
 
@@ -199,14 +341,17 @@ def build_trade_candidates_from_leaderboard(
     candidates = []
     items = leaderboard_items[:limit] if limit else leaderboard_items
     signal_key = storage.leaderboard_signal_key(conn)
+    regime = _evaluate_market_regime(conn)
     for rank, item in enumerate(items, 1):
         token = item["token"]
+        if _is_benchmark_token_excluded(token):
+            continue
         market = item.get("market") or _load_market(conn, token)
         if not (market.get("snapshot") or {}).get("mark_price"):
             continue
         realtime = _load_realtime(conn, token)
         score_row = item.get("score_row") or item
-        result = evaluate_candidate(score_row, rank, market, realtime)
+        result = evaluate_candidate(conn, score_row, rank, market, realtime, regime=regime)
         result["score"] = score_row
         result["signal_key"] = signal_key
         result["has_active_position"] = storage.trade_has_active(conn, token)
@@ -233,9 +378,12 @@ def build_trade_candidates(conn, limit: int = 20, passed_only: bool = False) -> 
         -(item[0].get("score") or 0),
     ))
     candidates = []
+    regime = _evaluate_market_regime(conn)
     for rank, (score_row, market, _) in enumerate(sortable[:limit], 1):
+        if _is_benchmark_token_excluded(score_row["token"]):
+            continue
         realtime = _load_realtime(conn, score_row["token"])
-        result = evaluate_candidate(score_row, rank, market, realtime)
+        result = evaluate_candidate(conn, score_row, rank, market, realtime, regime=regime)
         result["score"] = score_row
         result["signal_key"] = signal_key
         result["has_active_position"] = storage.trade_has_active(conn, score_row["token"])
@@ -389,6 +537,9 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
     is_live = isinstance(executor, BinanceLiveExecutor)
     mode = "live" if is_live else "paper"
     token = (candidate.get("token") or "").upper() or "?"
+    if _is_benchmark_token_excluded(token):
+        _debug_reject(token, "基准币仅用于市场状态判断，不参与开仓", candidate)
+        return False
 
     if not candidate.get("passed"):
         _debug_reject(token, "candidate.passed=False（信号评估不通过）", candidate)
@@ -398,12 +549,23 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         return False
 
     tier = candidate.get("tier", "full")
+    side = (candidate.get("side") or "LONG").upper()
+    if side not in {"LONG", "SHORT"}:
+        _debug_reject(token, f"side 非法 ({side})", candidate)
+        return False
     if tier == "skip":
         _debug_reject(token, "tier=skip", candidate)
         return False
 
     if storage.trade_has_active(conn, token):
         _debug_reject(token, "DB 中已有活跃仓位（并发保护）", candidate)
+        return False
+
+    regime = _evaluate_market_regime(conn, settings=settings)
+    regime_blocks = regime.get("enabled") and not regime.get("allow_open")
+    short_override = regime.get("state") == "risk_off" and side == "SHORT"
+    if regime_blocks and not short_override:
+        _debug_reject(token, f"市场状态过滤: {regime.get('reason')}", candidate)
         return False
 
     # 账户级风控
@@ -413,8 +575,18 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         _debug_reject(token, f"账户风控: {risk_decision.reason}", candidate)
         return False
 
-    # 获取当前价
+    # 获取当前价：实盘开仓前优先使用"新鲜价格"重估，避免候选里遗留的旧缓存价
+    # 导致按低价算出过大数量（实际成交名义显著偏离目标名义）。
     raw_price = candidate.get("price")
+    if is_live:
+        market_ctx = candidate.get("market") or {}
+        realtime_ctx = candidate.get("realtime") or {}
+        # 仅在候选携带行情上下文时做 freshness 校验；避免无上下文时触发不必要的实时请求。
+        has_price_context = bool((market_ctx.get("snapshot") or {})) or bool(realtime_ctx)
+        if has_price_context:
+            refreshed_price = _position_price(token, market_ctx, realtime_ctx)
+            if refreshed_price and refreshed_price > 0:
+                raw_price = refreshed_price
     if not raw_price or raw_price <= 0:
         _debug_reject(token, f"价格无效 ({raw_price})", candidate)
         return False
@@ -425,11 +597,15 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
     # 计算 ATR 止损（基于估算入场价）
     klines = get_klines_1h(token, limit=max(30, config.TRADING_ATR_PERIOD + 2))
     stop_pct, stop_mode = risk.compute_stop_distance_pct(klines)
-    stop_loss_price = estimated_entry * (1 + stop_pct / 100)
+    stop_distance_pct = abs(stop_pct)
+    if side == "LONG":
+        stop_loss_price = estimated_entry * (1 - stop_distance_pct / 100)
+    else:
+        stop_loss_price = estimated_entry * (1 + stop_distance_pct / 100)
 
     # 计算仓位（先算，sizing 失败不应该消耗 signal_lock）
     leverage = float(settings.get("leverage") or config.TRADING_LEVERAGE)
-    sizing = risk.compute_position_size(account, estimated_entry, stop_loss_price, leverage, tier)
+    sizing = risk.compute_position_size(account, estimated_entry, stop_loss_price, leverage, tier, side=side)
     if sizing.get("quantity", 0) <= 0:
         _debug_reject(token, f"仓位计算: {sizing.get('note')}", candidate)
         return False
@@ -461,9 +637,13 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
             return False
 
     # 止盈：基于 R 值
-    risk_per_unit = estimated_entry - stop_loss_price
-    tp1_price = estimated_entry + risk_per_unit * config.TRADING_TP1_R
-    tp2_price = estimated_entry + risk_per_unit * config.TRADING_TP2_R
+    risk_per_unit = abs(estimated_entry - stop_loss_price)
+    if side == "LONG":
+        tp1_price = estimated_entry + risk_per_unit * config.TRADING_TP1_R
+        tp2_price = estimated_entry + risk_per_unit * config.TRADING_TP2_R
+    else:
+        tp1_price = estimated_entry - risk_per_unit * config.TRADING_TP1_R
+        tp2_price = estimated_entry - risk_per_unit * config.TRADING_TP2_R
 
     snapshot = {
         **candidate,
@@ -494,7 +674,15 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         order_result = executor.open_long(
             symbol=symbol,
             quantity=quantity,
-            entry_price=raw_price,
+            entry_price=estimated_entry,
+            stop_loss_price=stop_loss_price,
+            tp1_price=tp1_price,
+            tp1_qty=tp1_qty,
+            leverage=int(leverage),
+        ) if side == "LONG" else executor.open_short(
+            symbol=symbol,
+            quantity=quantity,
+            entry_price=estimated_entry,
             stop_loss_price=stop_loss_price,
             tp1_price=tp1_price,
             tp1_qty=tp1_qty,
@@ -518,19 +706,29 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
 
     # 用实际成交价重新计算止盈止损
     if is_live and entry_price != estimated_entry:
-        stop_loss_price = entry_price * (1 + stop_pct / 100)
-        risk_per_unit = entry_price - stop_loss_price
-        tp1_price = entry_price + risk_per_unit * config.TRADING_TP1_R
-        tp2_price = entry_price + risk_per_unit * config.TRADING_TP2_R
+        if side == "LONG":
+            stop_loss_price = entry_price * (1 - stop_distance_pct / 100)
+        else:
+            stop_loss_price = entry_price * (1 + stop_distance_pct / 100)
+        risk_per_unit = abs(entry_price - stop_loss_price)
+        if side == "LONG":
+            tp1_price = entry_price + risk_per_unit * config.TRADING_TP1_R
+            tp2_price = entry_price + risk_per_unit * config.TRADING_TP2_R
+        else:
+            tp1_price = entry_price - risk_per_unit * config.TRADING_TP1_R
+            tp2_price = entry_price - risk_per_unit * config.TRADING_TP2_R
         notional = entry_price * actual_qty
         margin = notional / leverage
+    placed_stop = (order_result.extra or {}).get("placed_stop_price")
+    if is_live and placed_stop:
+        stop_loss_price = float(placed_stop)
 
     mode_label = "实盘" if is_live else "模拟"
     stop_pending = bool(order_result.extra.get("stop_order_pending")) if order_result.extra else False
     position = {
         "token": token,
         "symbol": symbol,
-        "side": "LONG",
+        "side": side,
         "status": "OPEN",
         "mode": mode,
         "margin_amount": margin,
@@ -548,6 +746,7 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         "signal_snapshot": json.dumps(snapshot, default=str, ensure_ascii=False),
         "open_reason": (
             f"{mode_label}开仓 tier={tier} | "
+            f"方向={side} | "
             f"信号分={candidate.get('analysis_score')} | "
             f"通过 {candidate.get('pass_count')}/7 | "
             f"止损 {stop_mode} {sizing.get('stop_distance_pct', 0):.2f}% | "
@@ -573,7 +772,7 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
                 file=sys.stderr, flush=True,
             )
             try:
-                close_result = executor.close_position(symbol, actual_qty, "db_insert_failed")
+                close_result = executor.close_position(symbol, actual_qty, side=side, reason="db_insert_failed")
                 if close_result.success:
                     print(
                         f"[trade-logic] 紧急平仓成功 {token}",
@@ -627,17 +826,16 @@ def manual_open_on_watch(conn, token: str, settings: dict, executor=None) -> dic
     is_live = isinstance(executor, BinanceLiveExecutor)
     mode = "live" if is_live else "paper"
     token = token.upper()
+    if _is_benchmark_token_excluded(token):
+        return {"ok": False, "reason": f"{token} 仅作为 Regime 基准，不参与开仓"}
 
     if storage.trade_has_active(conn, token):
         return {"ok": False, "reason": f"{token} 已有持仓或挂单"}
 
     market = _load_market(conn, token)
     realtime = _load_realtime(conn, token)
-    raw_price = _current_price(market, realtime)
-
-    # 如果本地缓存没有价格，尝试实时拉一次
-    if not raw_price or raw_price <= 0:
-        raw_price = get_mark_price(token)
+    # 手动开仓同样优先用新鲜价格，避免旧 realtime 缓存导致估算入场价失真。
+    raw_price = _position_price(token, market, realtime)
     if not raw_price or raw_price <= 0:
         return {"ok": False, "reason": f"{token} 缺少可用市价（可能没有永续合约或接口超时）"}
 
@@ -702,7 +900,7 @@ def manual_open_on_watch(conn, token: str, settings: dict, executor=None) -> dic
     order_result = executor.open_long(
         symbol=symbol,
         quantity=quantity,
-        entry_price=raw_price,
+        entry_price=estimated_entry,
         stop_loss_price=stop_loss_price,
         tp1_price=tp1_price,
         tp1_qty=tp1_qty,
@@ -721,6 +919,9 @@ def manual_open_on_watch(conn, token: str, settings: dict, executor=None) -> dic
         tp2_price = entry_price + risk_per_unit * config.TRADING_TP2_R
         notional = entry_price * actual_qty
         margin = notional / leverage
+    placed_stop = (order_result.extra or {}).get("placed_stop_price")
+    if is_live and placed_stop:
+        stop_loss_price = float(placed_stop)
 
     snapshot = {
         "manual": True,
@@ -773,7 +974,7 @@ def manual_open_on_watch(conn, token: str, settings: dict, executor=None) -> dic
                 file=sys.stderr, flush=True,
             )
             try:
-                close_result = executor.close_position(symbol, actual_qty, "db_insert_failed")
+                close_result = executor.close_position(symbol, actual_qty, side="LONG", reason="db_insert_failed")
                 if close_result.success:
                     print(
                         f"[trade-logic] 手动开仓 DB 失败后紧急平仓成功 {token}",
@@ -854,7 +1055,9 @@ def manual_close_on_unwatch(conn, token: str, executor=None) -> dict:
                 executor.client.cancel_all_orders(symbol)
             except Exception:
                 pass
-            close_result = executor.close_position(symbol, open_qty, "unwatch")
+            close_result = executor.close_position(
+                symbol, open_qty, side=(pos.get("side") or "LONG"), reason="unwatch"
+            )
             if close_result.success:
                 exit_price = close_result.fill_price or price or 0
             else:
@@ -994,21 +1197,30 @@ def update_paper_positions(conn):
             continue
 
         entry = float(pos.get("entry_price") or pos.get("limit_price") or 0)
+        side = (pos.get("side") or "LONG").upper()
         if entry <= 0 or open_qty <= 0:
             continue
 
-        highest = max(float(pos.get("highest_price") or entry), price)
-        fields["highest_price"] = highest
+        extreme = float(pos.get("highest_price") or entry)
+        if side == "SHORT":
+            extreme = min(extreme, price)
+        else:
+            extreme = max(extreme, price)
+        fields["highest_price"] = extreme
         tp1 = float(pos.get("tp1_price") or 0)
         tp2 = float(pos.get("tp2_price") or 0)
         stop = float(pos.get("stop_loss_price") or 0)
 
         # ---- 止损：考虑滑点（比 stop 价更差的价格成交）----
-        if stop > 0 and price <= stop:
+        stop_hit = (stop > 0 and price <= stop) if side == "LONG" else (stop > 0 and price >= stop)
+        if stop_hit:
             # 真实场景止损触发时常有滑点；paper 交易模拟更保守的成交价
-            slip_factor = 1 - config.TRADING_STOP_SLIPPAGE_PCT / 100
-            fill_price = min(price, stop * slip_factor)
-            realized += (fill_price - entry) * open_qty
+            slip_pct = config.TRADING_STOP_SLIPPAGE_PCT / 100
+            if side == "LONG":
+                fill_price = min(price, stop * (1 - slip_pct))
+            else:
+                fill_price = max(price, stop * (1 + slip_pct))
+            realized += _realized_delta(side, entry, fill_price, open_qty)
             _archive_stop_loss(conn, pos, fill_price, realized, market, realtime)
             fields.update({
                 "status": "CLOSED",
@@ -1031,9 +1243,10 @@ def update_paper_positions(conn):
         tp1_done = closed_ratio >= tp1_pct - 1e-6
         tp2_done = closed_ratio >= (tp1_pct + tp2_pct) - 1e-6
 
-        if not tp1_done and tp1 > 0 and price >= tp1:
+        tp1_hit = (tp1 > 0 and price >= tp1) if side == "LONG" else (tp1 > 0 and price <= tp1)
+        if not tp1_done and tp1_hit:
             close_qty = qty * tp1_pct
-            realized += (tp1 - entry) * close_qty
+            realized += _realized_delta(side, entry, tp1, close_qty)
             closed_qty += close_qty
             open_qty = qty - closed_qty
             fields.update({
@@ -1046,12 +1259,16 @@ def update_paper_positions(conn):
             tp1_done = True
 
         # ---- 止盈 TP2：只在 TP1 已触发且 TP2 未触发时考虑 ----
-        if tp1_done and not tp2_done and tp2 > 0 and price >= tp2:
+        tp2_hit = (tp2 > 0 and price >= tp2) if side == "LONG" else (tp2 > 0 and price <= tp2)
+        if tp1_done and not tp2_done and tp2_hit:
             close_qty = qty * tp2_pct
-            realized += (tp2 - entry) * close_qty
+            realized += _realized_delta(side, entry, tp2, close_qty)
             closed_qty += close_qty
             open_qty = qty - closed_qty
-            trailing = highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100)
+            if side == "LONG":
+                trailing = extreme * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100)
+            else:
+                trailing = extreme * (1 + config.TRADING_TRAIL_CALLBACK_PCT / 100)
             fields.update({
                 "status": "PARTIAL",
                 "closed_qty": closed_qty,
@@ -1063,14 +1280,22 @@ def update_paper_positions(conn):
 
         # ---- 剩余仓位：跟踪止盈 ----
         if tp2_done and open_qty > 0:
-            trailing = max(float(pos.get("trailing_stop_price") or 0),
-                           highest * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100))
+            old_trailing = float(pos.get("trailing_stop_price") or 0)
+            if side == "LONG":
+                trailing = max(old_trailing, extreme * (1 - config.TRADING_TRAIL_CALLBACK_PCT / 100))
+            else:
+                candidate_trailing = extreme * (1 + config.TRADING_TRAIL_CALLBACK_PCT / 100)
+                trailing = candidate_trailing if old_trailing <= 0 else min(old_trailing, candidate_trailing)
             fields["trailing_stop_price"] = trailing
-            if price <= trailing:
+            trailing_hit = (price <= trailing) if side == "LONG" else (price >= trailing)
+            if trailing_hit:
                 # 跟踪止盈触发，也假设一点滑点
-                slip_factor = 1 - config.TRADING_STOP_SLIPPAGE_PCT / 100
-                fill_price = min(price, trailing * slip_factor)
-                realized += (fill_price - entry) * open_qty
+                slip_pct = config.TRADING_STOP_SLIPPAGE_PCT / 100
+                if side == "LONG":
+                    fill_price = min(price, trailing * (1 - slip_pct))
+                else:
+                    fill_price = max(price, trailing * (1 + slip_pct))
+                realized += _realized_delta(side, entry, fill_price, open_qty)
                 fields.update({
                     "status": "CLOSED",
                     "current_price": fill_price,
@@ -1084,7 +1309,7 @@ def update_paper_positions(conn):
                 storage.trade_position_update(conn, pos["id"], fields)
                 continue
 
-        unrealized = (price - entry) * open_qty
+        unrealized = _realized_delta(side, entry, price, open_qty)
         fields.update({
             "unrealized_pnl": unrealized,
             "pnl_pct": _margin_pnl_pct(realized, unrealized, float(pos.get("margin_amount") or 1)),

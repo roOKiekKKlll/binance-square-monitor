@@ -160,8 +160,8 @@ def test_manual_live_open_db_failure_triggers_emergency_close():
             extra={"entry_order_id": "12345"},
         )
 
-    def _close_position(symbol, quantity, reason=""):
-        close_calls.append((symbol, quantity, reason))
+    def _close_position(symbol, quantity, side="LONG", reason=""):
+        close_calls.append((symbol, quantity, side, reason))
         return OrderResult(success=True, order_id="54321", fill_price=99.8, fill_qty=quantity, status="FILLED")
 
     live_executor.open_long = _open_long
@@ -170,7 +170,7 @@ def test_manual_live_open_db_failure_triggers_emergency_close():
     with patch("trade_logic.storage.trade_has_active", return_value=False), \
          patch("trade_logic._load_market", return_value={}), \
          patch("trade_logic._load_realtime", return_value={}), \
-         patch("trade_logic._current_price", return_value=100.0), \
+         patch("trade_logic._position_price", return_value=100.0), \
          patch.object(config, "LIVE_MAX_POSITION_SIZE_USD", 1000.0), \
          patch.object(config, "LIVE_MAX_TOTAL_EXPOSURE_USD", 5000.0), \
          patch("trade_logic.get_klines_1h", return_value=[]), \
@@ -186,13 +186,14 @@ def test_manual_live_open_db_failure_triggers_emergency_close():
          }), \
          patch("trade_logic.storage.trade_open_positions", return_value=[]), \
          patch("trade_logic.storage.trade_position_insert", return_value=None):
-        result = trade_logic.manual_open_on_watch(conn, "BTC", settings, live_executor)
+        result = trade_logic.manual_open_on_watch(conn, "XRP", settings, live_executor)
 
     assert result["ok"] is False
     assert close_calls, f"DB 写入失败后应调用 close_position 进行紧急平仓，result={result}"
-    symbol, qty, reason = close_calls[0]
-    assert symbol == "BTCUSDT"
+    symbol, qty, side, reason = close_calls[0]
+    assert symbol == "XRPUSDT"
     assert abs(qty - 1.25) < 1e-9
+    assert side == "LONG"
     assert reason == "db_insert_failed"
     print(f"OK DB 失败已触发紧急平仓: {symbol} qty={qty} reason={reason}")
 
@@ -206,7 +207,7 @@ def test_live_open_failure_keeps_trading_enabled_but_signal_locked():
     storage.trading_settings_update(conn, {"enabled": True, "mode": "live"})
     settings = {"leverage": 2}
     candidate = {
-        "token": "BTC",
+        "token": "XRP",
         "passed": True,
         "has_active_position": False,
         "tier": "half",
@@ -250,6 +251,150 @@ def test_live_open_failure_keeps_trading_enabled_but_signal_locked():
     print("OK 实盘下单失败后保持交易开启并保留 signal lock，避免同信号循环下单")
 
 
+def test_regime_filter_blocks_open_when_enabled():
+    """开启市场状态过滤后，neutral/risk_off 时应在下单前拦截。"""
+    import trade_logic
+    from executor import BinanceLiveExecutor, OrderResult
+
+    conn = _setup_db()
+    storage.trading_settings_update(conn, {"enabled": True, "mode": "live"})
+    settings = {"leverage": 2}
+    candidate = {
+        "token": "BTC",
+        "passed": True,
+        "has_active_position": False,
+        "tier": "full",
+        "price": 100.0,
+        "signal_key": "sig-regime-block",
+        "analysis_score": 88,
+        "pass_count": 7,
+    }
+
+    with patch.dict(os.environ, {"BINANCE_API_KEY": "test-key", "BINANCE_API_SECRET": "test-secret"}):
+        live_executor = BinanceLiveExecutor()
+
+    called = {"open": 0}
+
+    def _open_long(**kwargs):
+        called["open"] += 1
+        return OrderResult(success=True, order_id="1", fill_price=100.0, fill_qty=1.0, status="FILLED")
+
+    live_executor.open_long = _open_long
+
+    with patch("trade_logic.storage.trade_has_active", return_value=False), \
+         patch("trade_logic._evaluate_market_regime", return_value={
+             "enabled": True,
+             "state": "risk_off",
+             "allow_open": False,
+             "reason": "BTC risk_off",
+         }), \
+         patch.object(config, "TRADING_REGIME_FILTER_ENABLED", True, create=True):
+        result = trade_logic.open_position(conn, candidate, settings, live_executor)
+
+    assert result is False
+    assert called["open"] == 0, "市场状态拦截应发生在下单前，不应触发 open_long"
+    print("OK Regime Filter 开启时可在下单前拦截 risk_off 场景")
+
+
+def test_benchmark_token_is_not_tradable():
+    """基准币（默认 BTC）仅用于 Regime 数据源，不应参与开仓。"""
+    import trade_logic
+    from executor import BinanceLiveExecutor, OrderResult
+
+    conn = _setup_db()
+    storage.trading_settings_update(conn, {"enabled": True, "mode": "live"})
+    settings = {"leverage": 2}
+    candidate = {
+        "token": "BTC",
+        "passed": True,
+        "has_active_position": False,
+        "tier": "full",
+        "price": 100.0,
+        "signal_key": "sig-benchmark-skip",
+        "analysis_score": 90,
+        "pass_count": 7,
+    }
+
+    with patch.dict(os.environ, {"BINANCE_API_KEY": "test-key", "BINANCE_API_SECRET": "test-secret"}):
+        live_executor = BinanceLiveExecutor()
+
+    called = {"open": 0}
+    live_executor.open_long = lambda **kwargs: called.__setitem__("open", called["open"] + 1) or OrderResult(
+        success=True, order_id="x", fill_price=100.0, fill_qty=1.0, status="FILLED"
+    )
+
+    with patch.object(config, "TRADING_REGIME_EXCLUDE_BENCHMARK_FROM_TRADING", True, create=True):
+        result = trade_logic.open_position(conn, candidate, settings, live_executor)
+
+    assert result is False
+    assert called["open"] == 0, "基准币应在下单前被拦截，不应触发 open_long"
+    print("OK Benchmark 仅作为 Regime 数据源，不参与开仓")
+
+
+def test_risk_off_candidate_opens_short():
+    """Regime=risk_off 且 side=SHORT 时应走 open_short 链路。"""
+    import trade_logic
+    from executor import BinanceLiveExecutor, OrderResult
+
+    conn = _setup_db()
+    storage.trading_settings_update(conn, {"enabled": True, "mode": "live", "regime_filter_enabled": True})
+    settings = {"leverage": 2}
+    candidate = {
+        "token": "XRP",
+        "passed": True,
+        "has_active_position": False,
+        "tier": "full",
+        "side": "SHORT",
+        "price": 100.0,
+        "signal_key": "sig-riskoff-short",
+        "analysis_score": 80,
+        "pass_count": 6,
+    }
+
+    with patch.dict(os.environ, {"BINANCE_API_KEY": "test-key", "BINANCE_API_SECRET": "test-secret"}):
+        live_executor = BinanceLiveExecutor()
+
+    calls = {"short": 0}
+    live_executor.open_short = lambda **kwargs: calls.__setitem__("short", calls["short"] + 1) or OrderResult(
+        success=True,
+        order_id="entry-short",
+        fill_price=100.0,
+        fill_qty=1.0,
+        status="FILLED",
+        extra={"entry_order_id": "entry-short", "stop_order_id": "stop-short"},
+    )
+    live_executor.open_long = lambda **kwargs: OrderResult(success=False, error="should-not-call-open-long")
+
+    with patch("trade_logic.storage.trade_has_active", return_value=False), \
+         patch("trade_logic.get_klines_1h", return_value=[]), \
+         patch("trade_logic._build_account_context", return_value=SimpleNamespace(equity=1000.0, available_balance=1000.0)), \
+         patch("trade_logic.risk.check_account_risk", return_value=SimpleNamespace(allowed=True, reason="")), \
+         patch("trade_logic.risk.compute_stop_distance_pct", return_value=(-2.0, "fixed")), \
+         patch("trade_logic.risk.compute_position_size", return_value={
+             "quantity": 1.0,
+             "margin": 50.0,
+             "notional": 100.0,
+             "risk_amount": 2.0,
+             "stop_distance_pct": 2.0,
+         }), \
+         patch("trade_logic.storage.trade_open_positions", return_value=[]), \
+         patch("trade_logic.storage.trade_signal_lock_acquire", return_value=True), \
+         patch("trade_logic.storage.trade_position_insert", return_value=123), \
+         patch("trade_logic.storage.trade_position_update_order_ids"), \
+         patch("trade_logic._evaluate_market_regime", return_value={
+             "enabled": True,
+             "state": "risk_off",
+             "allow_open": False,
+             "reason": "BTC risk_off",
+             "benchmark_token": "BTC",
+         }):
+        result = trade_logic.open_position(conn, candidate, settings, live_executor)
+
+    assert result is True
+    assert calls["short"] == 1, "risk_off short 应调用 open_short"
+    print("OK risk_off 下可触发 SHORT 开仓路径")
+
+
 if __name__ == "__main__":
     tests = [
         test_tp2_can_trigger,
@@ -257,6 +402,9 @@ if __name__ == "__main__":
         test_tp1_already_done_not_retriggered,
         test_manual_live_open_db_failure_triggers_emergency_close,
         test_live_open_failure_keeps_trading_enabled_but_signal_locked,
+        test_regime_filter_blocks_open_when_enabled,
+        test_benchmark_token_is_not_tradable,
+        test_risk_off_candidate_opens_short,
     ]
     failed = 0
     for t in tests:

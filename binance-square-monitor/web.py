@@ -67,6 +67,7 @@ class TradingSettingsBody(BaseModel):
     initial_balance: float | None = None
     leverage: int | None = None
     order_amount: float | None = None
+    regime_filter_enabled: bool | None = None
 
 
 class TradingResetBody(BaseModel):
@@ -446,7 +447,9 @@ def api_trading():
             settings = storage.trading_settings_get(conn)
             current_mode = settings.get("mode", "paper")
             account = trade_logic.account_summary(conn)
-            positions = storage.trade_positions_by_mode(conn, current_mode, limit=30)
+            # 活跃仓位必须全量展示，避免被“最近 N 条”截断造成数量错觉。
+            positions = storage.trade_positions_for_panel(conn, current_mode, closed_limit=30)
+            regime = trade_logic.market_regime_status(conn, settings=settings)
             leaderboard_items, _ = _build_leaderboard_items(conn)
             candidates = trade_logic.build_trade_candidates_from_leaderboard(
                 conn, leaderboard_items, passed_only=True)
@@ -471,6 +474,7 @@ def api_trading():
             "positions": positions,
             "candidates": candidates,
             "loss_archive": loss_archive,
+            "regime": regime,
         }
     return _cached("trading", 2.0, compute)
 
@@ -478,7 +482,7 @@ def api_trading():
 @app.post("/api/trading/settings")
 def api_trading_settings(body: TradingSettingsBody):
     fields = {}
-    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount"):
+    for key in ("enabled", "mode", "initial_balance", "leverage", "order_amount", "regime_filter_enabled"):
         value = getattr(body, key)
         if value is not None:
             fields[key] = value
@@ -932,6 +936,13 @@ tr.flash { animation: row-flash 1.5s ease-out; }
     <div>
       <label>开仓金额 USDT</label>
       <input id="trade-order-amount" type="number" min="1" step="1">
+    </div>
+    <div>
+      <label>市场状态过滤（Regime）</label>
+      <select id="trade-regime-filter-enabled">
+        <option value="false">关闭（按原逻辑）</option>
+        <option value="true">开启（仅趋势市开仓）</option>
+      </select>
     </div>
     <div style="display:flex;align-items:end;gap:8px;">
       <button class="refresh-btn" onclick="saveTradingSettings()">保存交易设置</button>
@@ -1519,6 +1530,7 @@ const fmtUsdGlobal = (v) => {
 
 function renderTradingPanel(data) {
   const acc = data.account || {};
+  const regime = data.regime || {};
   const settings = acc.settings || {};
   const active = document.activeElement;
   const editingSettings = active && active.closest && active.closest('.trade-controls');
@@ -1528,7 +1540,27 @@ function renderTradingPanel(data) {
     document.getElementById('trade-initial').value = settings.initial_balance ?? '';
     document.getElementById('trade-leverage').value = settings.leverage ?? '';
     document.getElementById('trade-order-amount').value = settings.order_amount ?? '';
+    document.getElementById('trade-regime-filter-enabled').value =
+      settings.regime_filter_enabled ? 'true' : 'false';
   }
+
+  const regimeStateRaw = String(regime.state || 'unknown');
+  const regimeStateLabelMap = {
+    trend: '趋势',
+    neutral: '中性',
+    risk_off: '风险关闭',
+    disabled: '已关闭',
+    unknown: '未知',
+  };
+  const regimeStateLabel = regimeStateLabelMap[regimeStateRaw] || regimeStateRaw;
+  const regimeStateCls =
+    regimeStateRaw === 'trend' ? 'green'
+    : (regimeStateRaw === 'risk_off' ? 'red'
+    : (regimeStateRaw === 'disabled' ? 'muted' : 'yellow'));
+  const regimeAllow = regime.allow_open ? '允许开仓' : '拦截开仓';
+  const regimeAllowCls = regime.allow_open ? 'green' : 'red';
+  const regimeBench = regime.benchmark_token || 'BTC';
+  const regimeReason = regime.reason || '-';
 
   document.getElementById('trade-summary').innerHTML = `
     <div class="metric"><div class="label">初始金额</div><div class="value">${fmtUsdGlobal(acc.initial_balance)}</div></div>
@@ -1537,6 +1569,11 @@ function renderTradingPanel(data) {
     <div class="metric"><div class="label">占用保证金</div><div class="value">${fmtUsdGlobal(acc.locked_margin)}</div></div>
     <div class="metric"><div class="label">已实现盈亏</div><div class="value">${fmtUsdGlobal(acc.realized_pnl)}</div></div>
     <div class="metric"><div class="label">浮动盈亏</div><div class="value">${fmtUsdGlobal(acc.unrealized_pnl)}</div></div>
+    <div class="metric" title="${regimeReason}">
+      <div class="label">市场状态（${regimeBench}）</div>
+      <div class="value ${regimeStateCls}">${regimeStateLabel}</div>
+      <div class="muted" style="font-size:11px;"><span class="${regimeAllowCls}">${regimeAllow}</span></div>
+    </div>
   `;
 
   renderTradePositions(data.positions || []);
@@ -1696,6 +1733,7 @@ async function saveTradingSettings() {
     initial_balance: Number(document.getElementById('trade-initial').value),
     leverage: Number(document.getElementById('trade-leverage').value),
     order_amount: Number(document.getElementById('trade-order-amount').value),
+    regime_filter_enabled: document.getElementById('trade-regime-filter-enabled').value === 'true',
   };
   try {
     const resp = await fetch('/api/trading/settings', {
