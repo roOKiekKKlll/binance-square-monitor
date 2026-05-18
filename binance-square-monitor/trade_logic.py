@@ -550,6 +550,11 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
 
     tier = candidate.get("tier", "full")
     side = (candidate.get("side") or "LONG").upper()
+
+    # === 新增：强行反向开空逻辑 ===
+    if getattr(config, "TRADING_REVERSE_LONG_TO_SHORT", False) and side == "LONG":
+        side = "SHORT"
+
     if side not in {"LONG", "SHORT"}:
         _debug_reject(token, f"side 非法 ({side})", candidate)
         return False
@@ -592,7 +597,10 @@ def open_position(conn, candidate: dict, settings: dict, executor=None) -> bool 
         return False
 
     # paper 模式加模拟滑点估算止损，live 模式用原始价格（实际成交价由交易所决定）
-    estimated_entry = raw_price * (1 + config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
+    if side == "LONG":
+        estimated_entry = raw_price * (1 + config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
+    else:
+        estimated_entry = raw_price * (1 - config.TRADING_ASSUMED_SLIPPAGE_PCT / 100)
 
     # 计算 ATR 止损（基于估算入场价）
     klines = get_klines_1h(token, limit=max(30, config.TRADING_ATR_PERIOD + 2))
@@ -1069,7 +1077,8 @@ def manual_close_on_unwatch(conn, token: str, executor=None) -> dict:
             exit_price = price
 
         entry = float(pos.get("actual_entry_price") or pos.get("entry_price") or pos.get("limit_price") or exit_price)
-        pnl = (exit_price - entry) * open_qty
+        side = (pos.get("side") or "LONG").upper()
+        pnl = (entry - exit_price) * open_qty if side == "SHORT" else (exit_price - entry) * open_qty
         realized += pnl
         realized_delta += pnl
         storage.trade_position_update(conn, pos["id"], {

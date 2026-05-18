@@ -753,8 +753,9 @@ def _do_reconcile(executor: BinanceLiveExecutor):
             exit_price, advice = _resolve_reconcile_exit_price(executor, pos, symbol)
             entry = float(pos.get("actual_entry_price") or pos.get("entry_price") or 0)
             realized = float(pos.get("realized_pnl") or 0)
+            side = (pos.get("side") or "LONG").upper()
             if exit_price and entry > 0:
-                realized += (float(exit_price) - entry) * db_open_qty
+                realized += (entry - float(exit_price)) * db_open_qty if side == "SHORT" else (float(exit_price) - entry) * db_open_qty
             current_price = float(exit_price) if exit_price else float(pos.get("current_price") or 0)
             with storage.get_conn() as conn:
                 margin = float(pos.get("margin_amount") or 1)
